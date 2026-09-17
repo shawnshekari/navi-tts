@@ -8,10 +8,24 @@ memory-bandwidth-bound, so the kernels are built around that.
 
 | Target | GPU | ROCm | RTF | Time to first audio |
 |---|---|---|---|---|
-| Workstation | Radeon RX 7900 XTX (gfx1100, 96 CU) | — | — | — |
+| Workstation | Radeon RX 7900 XTX (gfx1100, 96 CU) | ≥ 10.1 (built with 10.1.0, HIP 7.16) | — | — |
 | Mini PC | Strix Halo (gfx1151, 40 CU) | — | — | — |
 
-*(Numbers land here from the benchmark harness as milestones are reached.)*
+*(Numbers land here from `bench/results.jsonl` as milestones are reached.)*
+
+## Build (workstation)
+
+    cmake --preset xtx && cmake --build --preset xtx
+    ./build/xtx/navi-tts info --model models/qwen3-tts-0.6b-f16.navi --upload
+
+The preset picks the ROCm clang from `~/tools/therock-tarball/install` for
+host and device code; no `hipcc`, no system compiler. Weights are converted
+once, offline:
+
+    cd tools && uv sync && uv run convert.py ../models/Qwen3-TTS-12Hz-0.6B-Base ../models/qwen3-tts-0.6b-f16.navi
+
+`docs/DESIGN.md` is the design, `docs/model.md` the model, `docs/navi-format.md`
+the weight file.
 
 ## Scope
 

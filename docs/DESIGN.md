@@ -217,6 +217,10 @@ engine change.
    are not carried over).
 2. **Parity gates**, as the fork used: hidden within 0.02%, logits within 0.05%,
    greedy codes match 15/15 on the first frames, vocoder PCM within 1e-4.
+   Greedy is a code-for-code gate only: argmax decoding of this model collapses
+   into silence codes after ~10 frames and never emits EOS, so a greedy run
+   that sounds like nothing is correct, not a bug. Listen to the seeded sampled
+   reference (`tests/reference/sampled.wav`) instead.
 3. **Regression**: `cmp` on the WAV for the bench text at a pinned seed after
    every change; a difference is either an intended arithmetic change (then one
    seed re-audition, documented) or a bug.
@@ -294,9 +298,12 @@ to `bench/results.jsonl`; the README table is generated from that file.
 - **OPEN: 1.7B.** Same architecture scaled; RTF 3.0 on the fork's Vulkan path in
   June, never tried on HIP. Support via config is nearly free; tuning is not.
   Recommendation: load it as a stretch test in M3, don't target it.
-- **OPEN: ROCm version to pin.** The fork ran a therock nightly tarball with a
-  compiler-rt overlay workaround (`docs/reference/toolchain.md`). Pin whatever
-  builds cleanly on both machines at M0 and write it on the README front page.
+- **DECIDED: ROCm floor, not a pin - 10.1 or newer.** Enforced at configure
+  time (`NAVI_ROCM_MIN_VERSION`, from the install's `.info/version`) and at
+  runtime (the loaded HIP runtime must be at least the one the binary was
+  compiled against). The fork's compiler-rt overlay workaround
+  (`docs/reference/toolchain.md`) is not needed when the ROCm clang is called
+  directly. The version actually built with goes on the README front page.
 
 ## 10. Milestones
 
