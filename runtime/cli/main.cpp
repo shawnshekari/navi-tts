@@ -1,0 +1,187 @@
+// navi-tts: one binary. Subcommands:
+//   info   [--model FILE] [--upload]   device report; with a model, the tensor table check
+//   bench  --model FILE [--out FILE]   the harness (DESIGN 7); JSON line to stdout or appended to --out
+//   serve                              M1+
+
+#include "model/qwen3tts/params.h"
+#include "navi/build_info.h"
+#include "runtime/bench/bench.h"
+#include "runtime/common/error.h"
+#include "runtime/device/device.h"
+#include "runtime/weights/device_weights.h"
+#include "runtime/weights/navi_file.h"
+
+#include <cstdio>
+#include <cstring>
+#include <fstream>
+#include <string>
+#include <vector>
+
+namespace {
+
+struct Args {
+    std::string cmd;
+    std::string model;
+    std::string out;
+    bool upload = false;
+    bool verbose = false;
+    int repeats = 1;
+};
+
+int usage(const char * argv0) {
+    std::fprintf(stderr,
+        "navi-tts %s (%s, ROCm %s, %s)\n"
+        "usage: %s info  [--model FILE] [--upload] [-v]\n"
+        "       %s bench --model FILE [--out results.jsonl] [--repeats N]\n"
+        "       %s serve ...            (M1)\n",
+        NAVI_GIT_HASH, NAVI_GPU_ARCHS, NAVI_ROCM_VERSION, NAVI_BUILD_TYPE, argv0, argv0, argv0);
+    return 2;
+}
+
+Args parse(int argc, char ** argv) {
+    Args a;
+    if (argc < 2) return a;
+    a.cmd = argv[1];
+    for (int i = 2; i < argc; ++i) {
+        const std::string s = argv[i];
+        auto next = [&](const char * flag) -> std::string {
+            if (i + 1 >= argc) navi::fail(std::string(flag) + " needs a value");
+            return argv[++i];
+        };
+        if (s == "--model" || s == "-m") a.model = next("--model");
+        else if (s == "--out") a.out = next("--out");
+        else if (s == "--repeats") a.repeats = std::stoi(next("--repeats"));
+        else if (s == "--upload") a.upload = true;
+        else if (s == "-v" || s == "--verbose") a.verbose = true;
+        else navi::fail("unknown argument " + s);
+    }
+    return a;
+}
+
+void print_device(const navi::DeviceInfo & d, bool selected) {
+    std::printf("device %d%s: %s\n", d.index, selected ? " (selected)" : "", d.name.c_str());
+    std::printf("  arch              %s\n", d.arch.c_str());
+    std::printf("  multiprocessors   %d  (HIP multiProcessorCount; WGPs on RDNA3 - the cooperative grid size)\n",
+                d.multiprocessors);
+    std::printf("  wave size         %d\n", d.warp_size);
+    std::printf("  cooperative       %s\n", d.cooperative_launch ? "yes" : "no");
+    std::printf("  threads/block     %d,  LDS/block %zu KiB,  regs/block %d\n",
+                d.max_threads_per_block, d.lds_per_block / 1024, d.regs_per_block);
+    std::printf("  clocks            core %d MHz, mem %d MHz, bus %d bit, L2 %zu MiB\n",
+                d.clock_khz / 1000, d.mem_clock_khz / 1000, d.mem_bus_width, d.l2_bytes >> 20);
+    std::printf("  vram              %.2f GiB total, %.2f GiB free\n",
+                d.vram_total / 1073741824.0, d.vram_free / 1073741824.0);
+    std::printf("  hip               runtime %d, driver %d\n", d.hip_runtime_version, d.hip_driver_version);
+}
+
+int cmd_info(const Args & a) {
+    std::printf("navi-tts %s  built for %s  ROCm %s (needs >= %s)  %s\n", NAVI_GIT_HASH, NAVI_GPU_ARCHS,
+                NAVI_ROCM_VERSION, NAVI_ROCM_MIN_VERSION, NAVI_BUILD_TYPE);
+    const auto devs = navi::enumerate_devices();
+    if (devs.empty()) std::printf("no HIP devices visible\n");
+    navi::Device dev = navi::Device::open();   // throws with the refusal message
+    for (const auto & d : devs) print_device(d.index == dev.info().index ? dev.info() : d, d.index == dev.info().index);
+    if (a.model.empty()) return 0;
+
+    navi::NaviFile file = navi::NaviFile::open(a.model);
+    std::printf("\nmodel %s\n", a.model.c_str());
+    std::printf("  size              %.3f GB, data at +%llu\n", file.file_size() / 1e9,
+                static_cast<unsigned long long>(file.data_offset()));
+    std::printf("  kv                %zu entries\n", file.kv().size());
+    std::printf("  tensors           %zu\n", file.tensors().size());
+    if (a.verbose) {
+        for (const auto & [k, v] : file.kv()) {
+            std::printf("    %-48s ", k.c_str());
+            switch (v.type) {
+                case navi::KV::Type::I64: std::printf("%lld\n", static_cast<long long>(v.i64)); break;
+                case navi::KV::Type::F64: std::printf("%g\n", v.f64); break;
+                case navi::KV::Type::STR: std::printf("\"%s\"\n", v.str.c_str()); break;
+                case navi::KV::Type::I64_ARRAY: {
+                    std::printf("[");
+                    for (std::size_t i = 0; i < v.arr.size(); ++i)
+                        std::printf("%s%lld", i ? ", " : "", static_cast<long long>(v.arr[i]));
+                    std::printf("]\n");
+                    break;
+                }
+            }
+        }
+        for (const auto & t : file.tensors()) {
+            std::printf("    %-72s %-5s %s\n", t.name.c_str(), navi::dtype_name(t.dtype), t.shape_str().c_str());
+        }
+    }
+
+    const auto params = navi::qwen3tts::read_params(file);
+    std::printf("  arch              qwen3-tts  %s  (%s)\n", params.name.c_str(), params.dtype.c_str());
+    std::printf("  talker            %d layers, hidden %d, %d/%d heads x %d, ff %d, codec vocab %d, text vocab %d\n",
+                params.talker.n_layer, params.talker.hidden, params.talker.n_head, params.talker.n_kv_head,
+                params.talker.head_dim, params.talker.ff, params.talker.vocab, params.text_vocab);
+    std::printf("  code predictor    %d layers, hidden %d, %d/%d heads x %d, ff %d, %d codebooks x %d\n",
+                params.cp.n_layer, params.cp.hidden, params.cp.n_head, params.cp.n_kv_head, params.cp.head_dim,
+                params.cp.ff, params.n_code_groups, params.cp.vocab);
+    std::printf("  vocoder           %d layers, hidden %d, latent %d, %d x %d codebooks, %d samples/frame @ %d Hz%s\n",
+                params.vocoder.n_layer, params.vocoder.hidden, params.vq_latent, params.vq_n_q,
+                params.vq_codebook_size, params.codec_upsample, params.codec_sample_rate,
+                params.has_codec_encoder ? ", encoder included" : "");
+    std::printf("  languages        ");
+    for (const auto & [k, v] : params.language_ids) std::printf(" %s=%d", k.c_str(), v);
+    std::printf("\n");
+
+    const auto v = navi::qwen3tts::validate(file, params);
+    std::printf("  tensor table      %s: %zu missing, %zu shape mismatches, %zu unused\n",
+                v.ok() ? "ok" : "FAILED", v.missing.size(), v.shape_mismatch.size(), v.unused.size());
+    for (const auto & m : v.missing) std::printf("    missing   %s\n", m.c_str());
+    for (const auto & m : v.shape_mismatch) std::printf("    mismatch  %s\n", m.c_str());
+    for (const auto & m : v.unused) std::printf("    unused    %s\n", m.c_str());
+    if (!v.ok()) return 1;
+
+    if (a.upload) {
+        navi::DeviceWeights w = navi::DeviceWeights::upload(file);
+        file.close();
+        const auto & s = w.stats();
+        std::printf("  upload            %zu tensors, %.3f GB in %.0f ms (%.1f GB/s), arena %.3f GB\n",
+                    s.n_tensors, s.bytes / 1e9, s.seconds * 1e3, (s.bytes / 1e9) / s.seconds, s.arena_bytes / 1e9);
+        dev.refresh_memory();
+        std::printf("  vram after        %.2f GiB free\n", dev.info().vram_free / 1073741824.0);
+    }
+    return 0;
+}
+
+int cmd_bench(const Args & a) {
+    if (a.model.empty()) navi::fail("bench needs --model");
+    navi::Device dev = navi::Device::open();
+    navi::BenchOptions opt;
+    opt.model_path = a.model;
+    opt.repeats = a.repeats;
+    for (int i = 0; i < a.repeats; ++i) {
+        const navi::BenchResult r = navi::run_bench(dev, opt);
+        const std::string line = r.to_json();
+        if (a.out.empty()) {
+            std::printf("%s\n", line.c_str());
+        } else {
+            std::ofstream f(a.out, std::ios::app);
+            if (!f) navi::fail("cannot open " + a.out + " for append");
+            f << line << '\n';
+            std::fprintf(stderr, "appended to %s: upload %.0f ms, %.1f GB/s\n", a.out.c_str(), r.load_upload_ms,
+                         r.upload_gbps);
+        }
+    }
+    return 0;
+}
+
+} // namespace
+
+int main(int argc, char ** argv) {
+    try {
+        const Args a = parse(argc, argv);
+        if (a.cmd == "info") return cmd_info(a);
+        if (a.cmd == "bench") return cmd_bench(a);
+        if (a.cmd == "serve") navi::fail("serve arrives at M1");
+        return usage(argv[0]);
+    } catch (const navi::Error & e) {
+        std::fprintf(stderr, "navi-tts: %s\n", e.what());
+        return 1;
+    } catch (const std::exception & e) {
+        std::fprintf(stderr, "navi-tts: %s\n", e.what());
+        return 1;
+    }
+}
