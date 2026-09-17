@@ -1,0 +1,33 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 28, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "NAVI_ROCM_ROOT": "$env{HOME}/tools/therock-tarball/install",
+        "CMAKE_CXX_COMPILER": "$env{HOME}/tools/therock-tarball/install/lib/llvm/bin/clang++"
+      }
+    },
+    {
+      "name": "xtx",
+      "displayName": "RX 7900 XTX (gfx1100), Release",
+      "inherits": "base",
+      "cacheVariables": { "NAVI_GPU_ARCHS": "gfx1100" }
+    },
+    {
+      "name": "xtx-debug",
+      "displayName": "RX 7900 XTX (gfx1100), RelWithDebInfo",
+      "inherits": "xtx",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "xtx", "configurePreset": "xtx" },
+    { "name": "xtx-debug", "configurePreset": "xtx-debug" }
+  ]
+}

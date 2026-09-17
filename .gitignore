@@ -1,3 +1,6 @@
 models/*
 !models/README.md
 build*/
+tools/.venv/
+__pycache__/
+*.tmp
