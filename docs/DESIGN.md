@@ -276,9 +276,16 @@ to `bench/results.jsonl`; the README table is generated from that file.
 
 ## 9. Open questions
 
-- **OPEN: HTTP library.** cpp-httplib (single header, MIT) is the least code;
-  "no framework" was about tensor frameworks, not an HTTP parser. Recommendation:
-  use it, disable its optional zstd/openssl probes (the fork hit that).
+- **DECIDED: HTTP library - cpp-httplib** (single header, MIT, vendored in
+  `third_party/`), with its opportunistic zstd/openssl probes disabled at
+  configure time. It covers routing, multipart uploads and chunked streaming
+  responses, which is the whole contract. Batch-one, loopback-only traffic
+  makes an async framework (Drogon, Oat++) pure weight here; if the engine ever
+  becomes a shared multi-client service, the HTTP layer is the cheapest part to
+  swap. Streaming is a bounded queue between the serving thread (pushes each
+  vocoder batch's PCM) and the response's content-provider callback (writes
+  chunks as they arrive); a client that stops reading fails the request rather
+  than stalling the GPU worker.
 - **OPEN: ICL cloning (tokenizer encoder).** Voices registered with `ref_text`
   use in-context cloning and need the audio *encoder*; without it, cloning is
   speaker-embedding only (what runs today). The encoder is a fourth model
