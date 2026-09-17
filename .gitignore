@@ -1,2 +1,3 @@
-models/
+models/*
+!models/README.md
 build*/
