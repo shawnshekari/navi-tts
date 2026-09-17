@@ -53,6 +53,42 @@ TOKENIZER_CASES = [
     "日本語のテキストと中文混合 текст",
     "<|im_start|>assistant\nplain<|im_end|>\n",
     "x" * 300,
+    # NFC: decomposed input must tokenize like its composed form
+    "cafe\u0301 A\u030a ngstro\u0308m e\u0327\u0301 \u1112\u1161\u11ab\uae00 \u212b \u2126",
+    "café Å ångström ȩ́ 한글 Å Ω",
+    # case-aware split, CamelCase, all caps, mixed
+    "HelloWorld CamelCase HTTPServer XMLHttpRequest iPhone macOS ALLCAPS lowerUPPER ΑΒΓαβγ ÉCOLE École",
+    # the [\r\n/]* tail on the punctuation alternative
+    "a/b/c path/to/file.txt http://x.y/z ...///  -/\n/x",
+    # whitespace shapes
+    "\r\n", "a\r\nb", "a\n\n\nb", "a \n b", "a\n \n  b", "trailing   ", "  ", " ", "\t\t", "a\u00a0b \u3000c\u2003d",
+    "line1\nline2\n", "x\n\n", " \n\n ", "\n  x", "  \n",
+    # numbers
+    "3.14159 1,000,000 ١٢٣ ๑๒๓ Ⅻ ½ 2²",
+    # punctuation runs and symbols
+    "!!! ??? #hashtag @user $100 €50 50% 100°C (a) [b] {c} <d> a=b+c*d/e",
+    "\"quoted\" 'single' `back` «guillemets» 「括弧」",
+    # apostrophes and contractions, case-insensitive
+    "don't DON'T Don'T can't've it's I'm we'll they'd o'clock rock'n'roll ’smart’",
+    # emoji, ZWJ, skin tone, flags, non-BMP
+    "👍🏽 👨‍👩‍👧 🇺🇸 🏳️‍🌈 𝔘𝔫𝔦𝔠𝔬𝔡𝔢 😀😀😀",
+    # marks and letterless marks
+    "\u0301 1\u0301 a\u0301\u0301 \u05d0\u05b8 \u0e01\u0e34 \u0928\u094d\u0924\u0947",
+    # control characters, unusual whitespace, DEL
+    "a\x01b\x1cc\x7fd\x85e",
+    # code-ish
+    "def f(x):\n    return x**2  # comment\n",
+    "if (a && b) { c(); }\n",
+    # long words and repeats
+    "a" * 100, "ab" * 100, "supercalifragilisticexpialidocious antidisestablishmentarianism",
+    "😀" * 40, "  " * 20 + "x",
+    # special-token-like text that is not an added token, and the real ones mid-text
+    "<|im_start|> <|notatoken|> <tool_call>x</tool_call> <|endoftext|><|im_end|>",
+    "assistant\n", "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n",
+    # the TTS-Player queue's typical outputs
+    "Build finished: 3 warnings, 0 errors. Running tests...",
+    "Ok — I've updated tts_queue.py (lines 42–58) and restarted the service.",
+    "Yes.", "No", "", " ",
 ]
 
 
@@ -80,6 +116,7 @@ def main():
     ap.add_argument("--repetition-penalty", type=float, default=1.05,
                     help="the model's default; pure argmax (1.0) locks into a 2-frame loop and never emits EOS")
     ap.add_argument("--threads", type=int, default=8)
+    ap.add_argument("--tokenizer-only", action="store_true", help="only text_ids.npy and tokenizer_cases.json")
     a = ap.parse_args()
 
     torch.manual_seed(0)
@@ -106,6 +143,10 @@ def main():
     np.save(out / "text_ids.npy", text_ids[0].numpy().astype(np.int32))
     cases = {s: tts._tokenize_texts([s])[0][0].tolist() for s in TOKENIZER_CASES + [a.text]}
     (out / "tokenizer_cases.json").write_text(json.dumps(cases, ensure_ascii=False, indent=1))
+
+    if a.tokenizer_only:
+        print(f"wrote {len(cases)} tokenizer cases", file=sys.stderr)
+        return
 
     # --- speaker encoder -----------------------------------------------------
     sr = model.speaker_encoder_sample_rate

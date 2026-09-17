@@ -29,5 +29,9 @@
   "buildPresets": [
     { "name": "xtx", "configurePreset": "xtx" },
     { "name": "xtx-debug", "configurePreset": "xtx-debug" }
+  ],
+  "testPresets": [
+    { "name": "xtx", "configurePreset": "xtx", "output": { "outputOnFailure": true } },
+    { "name": "xtx-debug", "configurePreset": "xtx-debug", "output": { "outputOnFailure": true } }
   ]
 }

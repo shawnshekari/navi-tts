@@ -17,7 +17,8 @@ the docstring of the script and `docs/model.md` describe every file.
   find there.
 - `sampled_codes.npy` / `sampled_pcm.npy` / `sampled.wav` (model-default
   sampling, `torch.manual_seed(2)`, 72 frames = 138,240 samples = 5.76 s): the
-  vocoder gate and the only thing to listen to.
+  vocoder gate and the only thing to listen to. Confirmed by ear 2026-09-17:
+  it is voice_1 saying the bench text.
 
 Regenerate (about a minute on the workstation CPU):
 

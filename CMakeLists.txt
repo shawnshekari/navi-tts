@@ -89,7 +89,10 @@ add_custom_target(navi_build_info ALL
 
 # --- targets -----------------------------------------------------------------
 add_library(navi_runtime STATIC
+    runtime/common/json.cpp
     runtime/device/device.cpp
+    runtime/text/unicode.cpp
+    runtime/text/bpe.cpp
     runtime/weights/navi_file.cpp
     runtime/weights/device_weights.cpp
     runtime/bench/bench.cpp
@@ -100,8 +103,17 @@ add_dependencies(navi_runtime navi_build_info)
 
 add_library(navi_qwen3tts STATIC
     model/qwen3tts/params.cpp
+    model/qwen3tts/tokenizer.cpp
 )
 target_link_libraries(navi_qwen3tts PUBLIC navi_runtime)
 
 add_executable(navi-tts runtime/cli/main.cpp)
 target_link_libraries(navi-tts PRIVATE navi_qwen3tts navi_runtime)
+
+# --- tests -------------------------------------------------------------------
+# Parity gates against tests/reference (DESIGN 6). They need the converted model.
+set(NAVI_TEST_MODEL "${CMAKE_SOURCE_DIR}/models/qwen3-tts-0.6b-f16.navi" CACHE FILEPATH ".navi used by the tests")
+enable_testing()
+add_executable(test_tokenizer tests/test_tokenizer.cpp)
+target_link_libraries(test_tokenizer PRIVATE navi_qwen3tts navi_runtime)
+add_test(NAME tokenizer COMMAND test_tokenizer "${NAVI_TEST_MODEL}" "${CMAKE_SOURCE_DIR}/tests/reference/tokenizer_cases.json")

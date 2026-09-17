@@ -82,7 +82,27 @@ speakers (`spk_id` is empty): every voice is a cloned speaker embedding.
 
 The tokenizer is the Qwen2/Qwen3 byte-level BPE (`vocab.json` 151643 entries,
 `merges.txt`, plus 33 added tokens 151643–151675 from `tokenizer_config.json`).
-`add_prefix_space` and `add_bos_token` are off.
+`add_prefix_space` and `add_bos_token` are off. The reference dumps come from
+HF's **fast** tokenizer (the model directory has no `tokenizer.json`; transformers
+4.57 converts the slow one), whose pipeline is what `model/qwen3tts/tokenizer`
+reproduces exactly:
+
+1. Added tokens (all 33, special or not; none with lstrip/rstrip/normalized)
+   are cut out of the raw text first, leftmost-longest.
+2. Each remaining segment is **NFC**-normalised.
+3. Pre-tokenisation with the Qwen2 fast pattern, ordered alternation:
+   `[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+`
+   | `[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*`
+   | `\p{N}` | ` ?[^\s\p{L}\p{N}]+[\r\n/]*` | `\s*[\r\n]+` | `\s+(?!\S)` | `\s+`.
+   Note what this is *not*: no `'s|'t|…` contraction alternative (an
+   apostrophe is the optional prefix of the letter run: `It's` → `It`, `'s`),
+   CamelCase splits at the case change, and the punctuation alternative
+   swallows trailing `/` as well as CR/LF.
+4. Byte-level BPE over each piece's UTF-8 bytes, merging one pair at a time in
+   rank order (HF's heap semantics, which differ from "merge every occurrence
+   of the best pair" on some inputs).
+
+Decoding returns the NFC form of what was encoded.
 
 ### Prompt layout (speaker-embedding cloning, streaming text mode)
 
