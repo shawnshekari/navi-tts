@@ -1,0 +1,45 @@
+{
+ "model": "Qwen3-TTS-12Hz-0.6B-Base",
+ "model_config_sha256": "2e714c787c8edb98b05432685cddb634add2de4d4e645f653d68251ef72ba011",
+ "safetensors_sha256": "180b3b10eb1c9f1b4db7806d5475bae3071c0243c299d49926bab1da3b6946f6",
+ "codec_safetensors_sha256": "836b7b357f5ea43e889936a3709af68dfe3751881acefe4ecf0dbd30ba571258",
+ "text": "The quick brown fox jumps over the lazy dog, and the bench text stays fixed.",
+ "language": "english",
+ "voice_wav": "voice_1.wav",
+ "voice_wav_sha256": "bac57946c356d1d2614d6d9b41c72dfc5934db965365e39463ac03a258aec38d",
+ "voice_samples": 360000,
+ "sample_rate": 24000,
+ "prompt_text": "<|im_start|>assistant\nThe quick brown fox jumps over the lazy dog, and the bench text stays fixed.<|im_end|>\n<|im_start|>assistant\n",
+ "n_text_ids": 25,
+ "prefill_len": 10,
+ "trailing_len": 17,
+ "greedy_frames": 31,
+ "sampled_frames": 72,
+ "sampled_samples": 138240,
+ "sampled_seed": 2,
+ "suppress_tokens": [
+  2048,
+  3071,
+  "range, minus codec_eos"
+ ],
+ "greedy": {
+  "do_sample": false,
+  "subtalker_dosample": false,
+  "repetition_penalty": 1.05,
+  "max_new_tokens": 32,
+  "min_new_tokens": 2,
+  "non_streaming_mode": false,
+  "audio": "NOT SPEECH. Argmax decoding of this model collapses into a loop of silence codes after ~10 frames and never emits EOS (with or without the repetition penalty). Compare greedy_codes code-for-code; never decode it, never listen to it. The audible reference is the sampled run."
+ },
+ "sampled": {
+  "note": "model.generate defaults (generation_config.json), torch.manual_seed(sampled_seed)",
+  "max_new_tokens": 400
+ },
+ "dtype": "float32",
+ "device": "cpu",
+ "torch": "2.14.0+cpu",
+ "transformers": "4.57.3",
+ "qwen_tts": "0.1.1",
+ "python": "3.13.7",
+ "numpy": "2.5.3"
+}
