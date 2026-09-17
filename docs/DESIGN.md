@@ -237,6 +237,14 @@ engine change.
 
 Numbers go on the README front page from the bench harness, per release.
 
+**Measurement, two tools:** `GET /metrics` (Prometheus text format, llama.cpp
+naming, scraped via the workstation's node_exporter textfile collector) is what
+production experiences over time - live RTF, stage split, TTFA histogram,
+barrier timeouts, frame-cap hits. `navi-tts bench` is the controlled A/B: same
+code path as serving, no HTTP, fixed text/voice/seed, emits JSON (git hash, gfx
+target, ROCm version, ms/frame by stage, TTFA, RTF, WAV sha256) that is appended
+to `bench/results.jsonl`; the README table is generated from that file.
+
 ## 8. Strix Halo
 
 - Starts at M3, after the XTX is in production. Until then the build is
@@ -249,6 +257,22 @@ Numbers go on the README front page from the bench harness, per release.
   bandwidth-bound phases (vocoder convs, prefill) to be the ones that slow down.
   If the frame kernel holds ~10-12 ms on 40 CUs, RTF lands ~0.15-0.2, which is
   comfortably useful for the mini PC.
+
+## 8b. Host and toolchain — DECIDED
+
+- **Compiler:** the ROCm clang (AMD clang 23, ROCm 10.1.0 therock) for host and
+  device alike, invoked directly with `-x hip --offload-arch=gfx1100`; no
+  `hipcc` wrapper, no system g++ for host objects (the mixed-toolchain link
+  failure in `docs/reference/toolchain.md` is why). C++20, `-O3 -march=znver3
+  -flto`, `-ffast-math` off until the parity gates pass without it. CMake +
+  Ninja with presets (`xtx`, later `strix`).
+- **CPU is off the fast path.** Ryzen 7 5800X3D; the host does HTTP, BPE, one
+  launch per frame, one wait, WAV out. What it owes the design is latency
+  hygiene, not throughput: spin-wait on completion (`hipDeviceScheduleSpin` or a
+  mapped flag) rather than yield; pinned host buffers for codes and PCM; one
+  pinned serving thread for the single in-flight request, HTTP accept on
+  another; `mmap` → upload → `munmap` for weights, no host copy retained.
+- **Python** only offline, in `tools/` (converter, reference dumps), via `uv`.
 
 ## 9. Open questions
 
