@@ -15,7 +15,10 @@ Fields: `ts`, `git`, `gfx`, `rocm`, `hip_runtime`, `device`, `multiprocessors`,
 `cp_ms`, `vocoder_ms_per_frame`, `ttfa_ms`, `rtf`, `n_frames`, `wav_sha256`
 (`talker_ms` / `cp_ms` stay `null`: one launch per frame, not split), and the
 fixed `text` / `seed`. `tools/bench_table.py` regenerates the README table
-from this file; never type numbers into the README.
+from this file; never type numbers into the README. The utterance runs with
+the streaming batch configuration (`STREAM_FIRST_BATCH` then `STREAM_BATCH`,
+graph.h) so `ttfa_ms` is what a streaming client sees; `--batch N` measures a
+fixed batch instead (32 = a whole-body request, the queue's case).
 
 The bench text and seed are the same ones `tools/dump_reference.py` uses
 (`tests/reference/manifest.json`), so a `wav_sha256` change is either an

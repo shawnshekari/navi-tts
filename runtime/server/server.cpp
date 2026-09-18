@@ -93,11 +93,6 @@ void send_error(httplib::Response & res, int status, const std::string & message
     res.set_content(err.dump(), "application/json");
 }
 
-// Streaming batch sizes (frames; 12.5 frames/s). Measured on the XTX: first
-// audio 67 ms at 4 frames vs 102 at 8; vocoder 1.17 ms/frame at 16 vs 1.56 at 8.
-constexpr int STREAM_FIRST_BATCH = 4;
-constexpr int STREAM_BATCH = 16;
-
 // The bounded queue between the worker (producer: one vocoder batch at a
 // time) and the response's content provider (consumer). If the consumer
 // stops taking - the client stopped reading - the producer's push times out
@@ -610,9 +605,9 @@ private:
                 if (stream == "audio" || stream == "sse") {
                     // Batching does not change the PCM, only when it arrives: a small first
                     // batch for time to first audio, then bigger ones for the vocoder's sake.
-                    sp->sr.vocoder_batch = static_cast<int>(body.int_or("stream_batch_size", STREAM_BATCH));
+                    sp->sr.vocoder_batch = static_cast<int>(body.int_or("stream_batch_size", qwen3tts::STREAM_BATCH));
                     if (sp->sr.vocoder_batch < 1 || sp->sr.vocoder_batch > 64) { send_error(res, 400, "'stream_batch_size' out of range (1-64)"); return; }
-                    sp->sr.first_batch = std::min(STREAM_FIRST_BATCH, sp->sr.vocoder_batch);
+                    sp->sr.first_batch = std::min(qwen3tts::STREAM_FIRST_BATCH, sp->sr.vocoder_batch);
                     speak_stream(sp, stream == "sse", fmt == "pcm", res);
                 } else if (stream.empty()) {
                     sp->sr.vocoder_batch = 0;   // whole body: the vocoder's max batch is the cheapest

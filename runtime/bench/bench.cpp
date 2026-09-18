@@ -138,7 +138,8 @@ BenchResult run_bench(const Device & dev, const BenchOptions & opt) {
     sr.sampling.repetition_penalty = params.repetition_penalty;
     sr.sampling.cp_temperature = params.cp_temperature;
     sr.sampling.cp_top_k = params.cp_top_k;
-    sr.vocoder_batch = opt.vocoder_batch;
+    sr.vocoder_batch = opt.vocoder_batch > 0 ? opt.vocoder_batch : qwen3tts::STREAM_BATCH;
+    sr.first_batch = opt.vocoder_batch > 0 ? opt.vocoder_batch : qwen3tts::STREAM_FIRST_BATCH;
     std::vector<float> pcm;
     for (int i = 0; i < opt.warmup; ++i) graph->synth(sr, pcm);
     const qwen3tts::SynthStats st = graph->synth(sr, pcm);

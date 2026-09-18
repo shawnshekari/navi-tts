@@ -22,6 +22,13 @@
 
 namespace navi::qwen3tts {
 
+// Streaming batch sizes (frames; 12.5 frames/s). Measured on the XTX: first
+// audio 67 ms at 4 frames vs 102 at 8; vocoder 1.17 ms/frame at 16 vs 1.56 at 8.
+// Batching never changes the PCM. The server streams with these; the bench
+// measures this configuration.
+constexpr int STREAM_FIRST_BATCH = 4;
+constexpr int STREAM_BATCH = 16;
+
 struct SynthRequest {
     std::string text;
     std::string language = "english";
