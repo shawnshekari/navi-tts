@@ -113,12 +113,52 @@ The cap is a constant today (`frame.hip:70`, `B.spin_cap = opt.spin_cap`).
 ## Strix Halo (M3) — first numbers 2026-09-18, `403af27`
 
 Frame 20.1 ms, prefill 16.5, vocoder 1.27 ms/frame, TTFA 98 ms, RTF 0.271,
-sha `4cb7232a…` (= the XTX). Everything is 2.5-3.3× the XTX, the bandwidth
-ratio, so the levers are the same ones in the same order — and int8 (M4)
-is worth proportionally more here. Not yet done: fat binary, a service
-unit, the grid/spin parameters from data (the frame kernel runs 20 blocks
-at occupancy 3; the spin cap is the XTX's), `libstdc++-devel` on the host
-(`docs/reference/toolchain.md`).
+sha `4cb7232a…` (= the XTX). What the probes said (`bench/micro/stream.hip`):
+coalesced streams reach 140-190 GB/s from GTT (~256 theoretical); the frame
+already runs ~210 inside its matvec phases, so f16 weights are at the
+ceiling there. A 34 MB working set streams at ~500 GB/s: the 32 MB MALL.
+sysfs `pp_dpm_sclk` read 600-690 MHz *during* a probe (table: 600 / 1100 /
+2900). RDNA 3.5 adds nothing ISA-wise this workload can use beyond what
+gfx1100 has (WMMA, v_dot4); the platform differences are memory, clocks,
+20 WGPs and a shared power budget. Experiments, in the order they are
+worth running - none started:
+
+- [ ] **Clocks under load** (cheap, possibly large). If the 600-690 MHz
+      reading is real, every non-streaming phase - attention, sampling,
+      barrier waits, norms, ~22 % of the XTX frame - runs at a quarter of
+      the advertised clock, which would explain those phases scaling 3×
+      when the CU ratio is 2.4×. Read `gpu_metrics` (average_gfxclk) during
+      a bench; then compare `power_dpm_force_performance_level=high` (root)
+      against `auto`. If it matters, it is a deployment setting, not code.
+- [ ] **int8 weights** (M4) — the only lever on the frame itself, and worth
+      more here than on the XTX: 1.8× the compute per byte of bandwidth, so
+      the convert-per-byte that capped the XTX at 0.55× should sit closer
+      to the 0.5× byte ratio. Projection frame ~11-12 ms, RTF ~0.15. Same
+      cost and quality gate as the M4 entry above.
+- [ ] **Grid and occupancy on 20 WGPs.** The frame runs 20 blocks at
+      occupancy 3 with the XTX's spin cap. Try 2 blocks per WGP and 512-
+      thread blocks (the barrier is cheaper with 20 blocks; the phases are
+      longer). The XTX's "1 block/CU under contention" finding needs its
+      own measurement here - the mini PC runs llama containers too
+      (`tests/contention.sh`, `gpu_hog` for gfx1151).
+- [ ] **Spin cap from Strix p99**, once a service unit exists there and
+      `/metrics` has a day of data. Item 4's twin.
+- [ ] **VRAM carve-out vs GTT.** Inconclusive today (the probe was too
+      short to capture residency). Redo with a longer run into the 512 MiB
+      carve-out; if it streams faster than GTT, the BIOS UMA frame-buffer
+      setting is the lever (user's call; 8-16 GB would hold the model).
+- [ ] **Host-coherent weights** (DESIGN §8's experiment): map the `.navi`
+      file and let the GPU read fine-grained host memory - no 2 GB upload
+      (386 ms at start) and no second copy. Measure the stream rate first;
+      fine-grained mappings are often uncached. Low value unless it is free.
+- [ ] **Vocoder and prefill kernels at 40 CUs**: re-run `conv7.hip` and
+      `gemm_skinny.hip` on gfx1151 - tile and grid choices were made on 96
+      CUs. Vocoder is 2.0× the XTX (bandwidth, expected), prefill 2.4×
+      (latency-bound kernel on fewer, slower CUs). TTFA-only, ~10-20 ms.
+- [ ] **Plumbing, not tuning**: fat binary (`NAVI_GPU_ARCHS=gfx1100;gfx1151`),
+      a `navi-tts.service` on the mini PC, `libstdc++-devel` there, `gpu_hog`
+      in the strix preset. `-march=znver5` for the host is free but the host
+      is off the fast path.
 
 ## Decisions this list is waiting on
 
