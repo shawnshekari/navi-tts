@@ -13,6 +13,7 @@
 #include <deque>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <random>
 #include <initializer_list>
@@ -51,6 +52,11 @@ public:
         dcv.wait(dl, [&] { return done; });
         if (err) std::rethrow_exception(err);
     }
+    // Queues `job` and returns; the job must handle its own exceptions.
+    void post(std::function<void()> job) {
+        { std::lock_guard<std::mutex> l(m_); q_.push_back(std::move(job)); }
+        cv_.notify_one();
+    }
 
 private:
     void loop() {
@@ -81,6 +87,80 @@ void send_error(httplib::Response & res, int status, const std::string & message
     err.set("error", inner);
     res.status = status;
     res.set_content(err.dump(), "application/json");
+}
+
+// The bounded queue between the worker (producer: one vocoder batch at a
+// time) and the response's content provider (consumer). If the consumer
+// stops taking - the client stopped reading - the producer's push times out
+// and the request fails; the GPU worker never waits on a socket.
+class PcmQueue {
+public:
+    static constexpr std::size_t CAPACITY = 16;              // batches; 16 x 8 frames = ~10 s of audio
+    static constexpr std::chrono::seconds PUSH_TIMEOUT{10};
+
+    // Producer. false: the consumer is gone or stalled; the producer must stop.
+    bool push(std::vector<std::int16_t> chunk) {
+        std::unique_lock<std::mutex> l(m_);
+        if (!cv_.wait_for(l, PUSH_TIMEOUT, [&] { return aborted_ || q_.size() < CAPACITY; })) { aborted_ = true; return false; }
+        if (aborted_) return false;
+        q_.push_back(std::move(chunk));
+        cv_.notify_all();
+        return true;
+    }
+    // Producer, once: no more chunks. `error` empty on success.
+    void finish(std::string error) {
+        std::lock_guard<std::mutex> l(m_);
+        done_ = true;
+        error_ = std::move(error);
+        cv_.notify_all();
+    }
+    // Consumer. false with an empty chunk: the stream is over (see error()).
+    bool pop(std::vector<std::int16_t> & chunk) {
+        std::unique_lock<std::mutex> l(m_);
+        cv_.wait(l, [&] { return done_ || !q_.empty(); });
+        if (q_.empty()) return false;
+        chunk = std::move(q_.front());
+        q_.pop_front();
+        cv_.notify_all();
+        return true;
+    }
+    // Consumer: waits until the first chunk or the end; true if audio is coming.
+    bool wait_first() {
+        std::unique_lock<std::mutex> l(m_);
+        cv_.wait(l, [&] { return done_ || !q_.empty(); });
+        return !q_.empty();
+    }
+    // Consumer: the client went away.
+    void abort() {
+        std::lock_guard<std::mutex> l(m_);
+        aborted_ = true;
+        q_.clear();
+        cv_.notify_all();
+    }
+    bool aborted() const { std::lock_guard<std::mutex> l(m_); return aborted_; }
+    std::string error() const { std::lock_guard<std::mutex> l(m_); return error_; }
+
+private:
+    mutable std::mutex m_;
+    std::condition_variable cv_;
+    std::deque<std::vector<std::int16_t>> q_;
+    bool done_ = false, aborted_ = false;
+    std::string error_;
+};
+
+std::string base64(const void * data, std::size_t n) {
+    static const char * tbl = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const auto * p = static_cast<const std::uint8_t *>(data);
+    std::string out;
+    out.reserve((n + 2) / 3 * 4);
+    for (std::size_t i = 0; i < n; i += 3) {
+        const std::uint32_t v = (std::uint32_t(p[i]) << 16) | (i + 1 < n ? std::uint32_t(p[i + 1]) << 8 : 0) | (i + 2 < n ? p[i + 2] : 0);
+        out += tbl[(v >> 18) & 63];
+        out += tbl[(v >> 12) & 63];
+        out += i + 1 < n ? tbl[(v >> 6) & 63] : '=';
+        out += i + 2 < n ? tbl[v & 63] : '=';
+    }
+    return out;
 }
 
 const std::map<std::string, std::string> LANG_CODES = {
@@ -118,7 +198,7 @@ public:
     void install(httplib::Server & svr) {
         svr.set_payload_max_length(64u << 20);
         svr.set_read_timeout(60);
-        svr.set_write_timeout(120);
+        svr.set_write_timeout(30);   // loopback: a socket that blocks this long is a dead client
         install_openai(svr);
         install_xtts(svr);
     }
@@ -197,14 +277,93 @@ private:
         return true;
     }
 
-    // Runs the request on the worker and answers with a whole WAV.
-    void speak_wav(const Speech & sp, httplib::Response & res) {
+    // Runs the request on the worker and answers with the whole body: a WAV, or raw s16le.
+    void speak_wav(const Speech & sp, bool raw_pcm, httplib::Response & res) {
         std::vector<float> pcm;
         qwen3tts::SynthStats st;
         worker_.run([&] { st = graph_.synth(sp.sr, pcm); });
-        const auto bytes = audio::wav_bytes(audio::to_s16(pcm), params_.codec_sample_rate);
-        res.set_content(reinterpret_cast<const char *>(bytes.data()), bytes.size(), "audio/wav");
+        const auto s16 = audio::to_s16(pcm);
+        if (raw_pcm) {
+            res.set_content(reinterpret_cast<const char *>(s16.data()), s16.size() * 2, "audio/pcm");
+        } else {
+            const auto bytes = audio::wav_bytes(s16, params_.codec_sample_rate);
+            res.set_content(reinterpret_cast<const char *>(bytes.data()), bytes.size(), "audio/wav");
+        }
         log_speech(sp, st);
+    }
+
+    // Streams the request: the worker pushes each vocoder batch as s16 into a
+    // bounded queue, the content provider drains it. Headers go out once the
+    // first batch (or the failure) is known, so an early error is still an
+    // HTTP status and the headers' arrival is the time to first audio.
+    //   audio: chunked body, WAV with a streaming header (0xFFFFFFFF sizes) or raw s16le
+    //   sse:   text/event-stream, speech.audio.delta {audio: base64 s16le} ..., speech.audio.done {navi: stats}
+    void speak_stream(std::shared_ptr<Speech> sp, bool sse, bool raw_pcm, httplib::Response & res) {
+        auto q = std::make_shared<PcmQueue>();
+        auto st = std::make_shared<qwen3tts::SynthStats>();
+        worker_.post([this, sp, q, st] {
+            std::string error;
+            try {
+                *st = graph_.synth(sp->sr, [&](std::span<const float> pcm) {
+                    if (!q->push(audio::to_s16(pcm))) fail("client stopped reading");
+                });
+            } catch (const std::exception & e) {
+                error = e.what();
+            }
+            q->finish(error);
+            if (error.empty()) log_speech(*sp, *st);
+            else if (opt_.verbose) std::fprintf(stderr, "speech %s: failed: %s\n", sp->voice_id.c_str(), error.c_str());
+        });
+        if (!q->wait_first()) {
+            const std::string err = q->error();
+            send_error(res, 500, err.empty() ? "no audio produced" : err, "engine_error");
+            return;
+        }
+        const int rate = params_.codec_sample_rate;
+        auto provider = [q, st, sse, raw_pcm, rate, first = true](std::size_t, httplib::DataSink & sink) mutable {
+            std::vector<std::int16_t> chunk;
+            std::string out;
+            if (first && !sse && !raw_pcm) {
+                const auto hdr = audio::wav_header(rate, audio::WAV_STREAMING);
+                out.assign(reinterpret_cast<const char *>(hdr.data()), hdr.size());
+            }
+            first = false;
+            if (q->pop(chunk)) {
+                if (sse) {
+                    Json ev;
+                    ev.set("type", "speech.audio.delta");
+                    ev.set("audio", base64(chunk.data(), chunk.size() * 2));
+                    out += "data: " + ev.dump() + "\n\n";
+                } else {
+                    out.append(reinterpret_cast<const char *>(chunk.data()), chunk.size() * 2);
+                }
+                if (!sink.write(out.data(), out.size())) { q->abort(); return false; }
+                return true;
+            }
+            if (sse) {
+                Json ev;
+                ev.set("type", q->error().empty() ? "speech.audio.done" : "error");
+                if (!q->error().empty()) ev.set("error", q->error());
+                Json usage;
+                usage.set("input_tokens", st->n_tokens); usage.set("output_tokens", st->n_frames);
+                usage.set("total_tokens", st->n_tokens + st->n_frames);
+                ev.set("usage", usage);
+                Json navi;
+                navi.set("frames", st->n_frames); navi.set("eos", st->eos); navi.set("audio_seconds", st->audio_s);
+                navi.set("prefill_ms", st->prefill_ms); navi.set("frames_ms", st->frames_ms); navi.set("vocoder_ms", st->vocoder_ms);
+                navi.set("ttfa_ms", st->ttfa_ms); navi.set("total_ms", st->total_ms); navi.set("rtf", st->rtf);
+                ev.set("navi", navi);
+                out += "data: " + ev.dump() + "\n\n";
+                if (!out.empty() && !sink.write(out.data(), out.size())) { q->abort(); return false; }
+            } else if (!out.empty() && !sink.write(out.data(), out.size())) {
+                q->abort(); return false;
+            }
+            sink.done();
+            return true;
+        };
+        res.set_chunked_content_provider(sse ? "text/event-stream" : raw_pcm ? "audio/pcm" : "audio/wav", provider,
+                                         [q](bool) { q->abort(); });
+        if (sse) res.set_header("Cache-Control", "no-cache");
     }
 
     void log_speech(const Speech & sp, const qwen3tts::SynthStats & st) {
@@ -295,15 +454,22 @@ private:
             try { body = Json::parse(req.body); } catch (const std::exception &) { send_error(res, 400, "invalid JSON"); return; }
             if (!body.is_object() || !body.find("input") || !body.get("input").is_string()) { send_error(res, 400, "'input' is required"); return; }
             try {
-                Speech sp;
-                if (!prepare(sp, body.get("input").as_string(), body.str_or("voice", "default"), body.str_or("language", "en"), res)) return;
-                sp.sr.seed = body.find("seed") ? static_cast<std::uint64_t>(body.get("seed").as_int()) : random_seed();
-                sp.sr.max_frames = static_cast<int>(body.int_or("max_audio_tokens", opt_.max_audio_tokens));
-                if (sp.sr.max_frames < 1 || sp.sr.max_frames > 4096) { send_error(res, 400, "'max_audio_tokens' out of range"); return; }
-                sp.sr.sampling.temperature = static_cast<float>(body.num_or("temperature", params_.temperature));
-                sp.sr.sampling.top_k = static_cast<int>(body.int_or("top_k", params_.top_k));
-                sp.sr.sampling.repetition_penalty = static_cast<float>(body.num_or("repetition_penalty", params_.repetition_penalty));
-                speak_wav(sp, res);
+                auto sp = std::make_shared<Speech>();
+                if (!prepare(*sp, body.get("input").as_string(), body.str_or("voice", "default"), body.str_or("language", "en"), res)) return;
+                sp->sr.seed = body.find("seed") ? static_cast<std::uint64_t>(body.get("seed").as_int()) : random_seed();
+                sp->sr.max_frames = static_cast<int>(body.int_or("max_audio_tokens", opt_.max_audio_tokens));
+                if (sp->sr.max_frames < 1 || sp->sr.max_frames > 4096) { send_error(res, 400, "'max_audio_tokens' out of range"); return; }
+                sp->sr.sampling.temperature = static_cast<float>(body.num_or("temperature", params_.temperature));
+                sp->sr.sampling.top_k = static_cast<int>(body.int_or("top_k", params_.top_k));
+                sp->sr.sampling.repetition_penalty = static_cast<float>(body.num_or("repetition_penalty", params_.repetition_penalty));
+                sp->sr.vocoder_batch = static_cast<int>(body.int_or("stream_batch_size", 8));
+                if (sp->sr.vocoder_batch < 1 || sp->sr.vocoder_batch > 64) { send_error(res, 400, "'stream_batch_size' out of range (1-64)"); return; }
+                const std::string fmt = body.str_or("response_format", "wav");
+                if (fmt != "wav" && fmt != "pcm") { send_error(res, 400, "'response_format' must be wav or pcm"); return; }
+                const std::string stream = body.str_or("stream_format", "");
+                if (stream == "audio" || stream == "sse") speak_stream(sp, stream == "sse", fmt == "pcm", res);
+                else if (stream.empty()) speak_wav(*sp, fmt == "pcm", res);
+                else { send_error(res, 400, "'stream_format' must be audio or sse"); return; }
             } catch (const navi::Error & e) {
                 send_error(res, 500, e.what(), "engine_error");
             } catch (const std::exception & e) {
@@ -399,7 +565,7 @@ private:
                 if (!voice) { xtts_error(res, 400, "no voice for speaker '" + speaker + "' and no fallback registered"); return; }
                 if (!prepare(sp, text, used, language, res)) return;
                 sp.sr.seed = stable_seed(speaker.empty() ? used : speaker);
-                speak_wav(sp, res);
+                speak_wav(sp, false, res);
             } catch (const navi::Error & e) {
                 xtts_error(res, 500, e.what());
             } catch (const std::exception & e) {

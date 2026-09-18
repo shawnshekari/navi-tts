@@ -21,13 +21,12 @@ std::vector<std::int16_t> to_s16(std::span<const float> pcm) {
     return out;
 }
 
-std::vector<std::uint8_t> wav_bytes(std::span<const std::int16_t> s16, int sample_rate) {
-    const std::uint32_t data_bytes = static_cast<std::uint32_t>(s16.size() * 2);
-    std::vector<std::uint8_t> out(44 + data_bytes);
+std::vector<std::uint8_t> wav_header(int sample_rate, std::uint32_t data_bytes) {
+    std::vector<std::uint8_t> out(44);
     auto put32 = [&](std::size_t at, std::uint32_t v) { std::memcpy(&out[at], &v, 4); };
     auto put16 = [&](std::size_t at, std::uint16_t v) { std::memcpy(&out[at], &v, 2); };
     std::memcpy(&out[0], "RIFF", 4);
-    put32(4, 36 + data_bytes);
+    put32(4, data_bytes == WAV_STREAMING ? WAV_STREAMING : 36 + data_bytes);
     std::memcpy(&out[8], "WAVEfmt ", 8);
     put32(16, 16);
     put16(20, 1);                       // PCM
@@ -38,6 +37,13 @@ std::vector<std::uint8_t> wav_bytes(std::span<const std::int16_t> s16, int sampl
     put16(34, 16);
     std::memcpy(&out[36], "data", 4);
     put32(40, data_bytes);
+    return out;
+}
+
+std::vector<std::uint8_t> wav_bytes(std::span<const std::int16_t> s16, int sample_rate) {
+    const std::uint32_t data_bytes = static_cast<std::uint32_t>(s16.size() * 2);
+    std::vector<std::uint8_t> out = wav_header(sample_rate, data_bytes);
+    out.resize(44 + data_bytes);
     std::memcpy(&out[44], s16.data(), data_bytes);
     return out;
 }

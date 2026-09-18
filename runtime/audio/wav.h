@@ -13,6 +13,8 @@
 namespace navi::audio {
 
 std::vector<std::int16_t> to_s16(std::span<const float> pcm);          // clamp, round to nearest
+constexpr std::uint32_t WAV_STREAMING = 0xFFFFFFFFu;                   // "length unknown" RIFF/data sizes
+std::vector<std::uint8_t> wav_header(int sample_rate, std::uint32_t data_bytes);   // 44 bytes, mono s16
 std::vector<std::uint8_t> wav_bytes(std::span<const std::int16_t> s16, int sample_rate);
 void write_wav(const std::string & path, std::span<const float> pcm, int sample_rate);
 
