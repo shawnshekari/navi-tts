@@ -106,7 +106,7 @@ add_library(navi_qwen3tts STATIC
     model/qwen3tts/params.cpp
     model/qwen3tts/tokenizer.cpp
 )
-navi_hip_sources(navi_qwen3tts model/qwen3tts/vocoder.hip model/qwen3tts/talker.hip)
+navi_hip_sources(navi_qwen3tts model/qwen3tts/vocoder.hip model/qwen3tts/talker.hip model/qwen3tts/frame.hip)
 target_link_libraries(navi_qwen3tts PUBLIC navi_runtime)
 
 add_executable(navi-tts runtime/cli/main.cpp)
@@ -125,3 +125,6 @@ add_test(NAME vocoder COMMAND test_vocoder "${NAVI_TEST_MODEL}" "${CMAKE_SOURCE_
 add_executable(test_prefill tests/test_prefill.cpp)
 target_link_libraries(test_prefill PRIVATE navi_qwen3tts navi_runtime)
 add_test(NAME prefill COMMAND test_prefill "${NAVI_TEST_MODEL}" "${CMAKE_SOURCE_DIR}/tests/reference")
+add_executable(test_frame tests/test_frame.cpp)
+target_link_libraries(test_frame PRIVATE navi_qwen3tts navi_runtime)
+add_test(NAME frame COMMAND test_frame "${NAVI_TEST_MODEL}" "${CMAKE_SOURCE_DIR}/tests/reference")
