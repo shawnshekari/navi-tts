@@ -97,6 +97,7 @@ add_library(navi_runtime STATIC
     runtime/weights/device_weights.cpp
     runtime/audio/wav.cpp
     runtime/bench/bench.cpp
+    runtime/voices/store.cpp
 )
 target_include_directories(navi_runtime PUBLIC "${CMAKE_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/generated")
 target_link_libraries(navi_runtime PUBLIC navi_rocm)

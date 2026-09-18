@@ -2,6 +2,7 @@
 
 #include "runtime/common/error.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -115,6 +116,41 @@ Wav read_wav(const std::string & path) {
     if (!f) fail("cannot read " + path);
     std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
     return parse_wav(bytes);
+}
+
+std::vector<float> resample(std::span<const float> pcm, int in_rate, int out_rate) {
+    if (in_rate == out_rate) return std::vector<float>(pcm.begin(), pcm.end());
+    if (in_rate <= 0 || out_rate <= 0) fail("resample: bad rate");
+    const double ratio = static_cast<double>(out_rate) / in_rate;      // output samples per input sample
+    const double fc = 0.5 * std::min(1.0, ratio);                      // cutoff, cycles per input sample
+    const int half = static_cast<int>(std::ceil(32.0 / std::min(1.0, ratio)));   // wider when downsampling
+    const std::size_t n_out = static_cast<std::size_t>(std::floor(static_cast<double>(pcm.size()) * ratio));
+    std::vector<float> out(n_out);
+    const double pi = 3.14159265358979323846;
+    for (std::size_t n = 0; n < n_out; ++n) {
+        const double x = static_cast<double>(n) / ratio;               // position in input samples
+        const long k0 = static_cast<long>(std::floor(x)) - half + 1;
+        const long k1 = static_cast<long>(std::floor(x)) + half;
+        double acc = 0.0, norm = 0.0;
+        for (long k = std::max(0L, k0); k <= std::min(static_cast<long>(pcm.size()) - 1, k1); ++k) {
+            const double t = static_cast<double>(k) - x;
+            const double a = 2.0 * fc * t;
+            const double sinc = a == 0.0 ? 1.0 : std::sin(pi * a) / (pi * a);
+            const double w = 0.42 + 0.5 * std::cos(pi * t / half) + 0.08 * std::cos(2.0 * pi * t / half);   // Blackman
+            const double h = 2.0 * fc * sinc * w;
+            acc += h * pcm[static_cast<std::size_t>(k)];
+            norm += h;
+        }
+        out[n] = norm != 0.0 ? static_cast<float>(acc / norm) : 0.f;   // unit DC gain, also at the edges
+    }
+    return out;
+}
+
+Wav to_rate(Wav wav, int rate) {
+    if (wav.sample_rate == rate) return wav;
+    wav.pcm = resample(wav.pcm, wav.sample_rate, rate);
+    wav.sample_rate = rate;
+    return wav;
 }
 
 } // namespace navi::audio

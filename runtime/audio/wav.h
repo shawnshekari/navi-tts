@@ -2,7 +2,8 @@
 
 // WAV out: 16-bit PCM mono. WAV in: PCM 8/16/24/32-bit and float32, any channel
 // count (averaged to mono); streaming headers with 0xFFFFFFFF sizes are accepted
-// (DESIGN 3.1). No resampling: the caller checks the rate.
+// (DESIGN 3.1). `resample` brings reference audio to the encoder's rate
+// (SkyrimNet uploads 22050 Hz game audio); the synthesis path never resamples.
 
 #include <cstdint>
 #include <span>
@@ -22,5 +23,11 @@ struct Wav {
 };
 Wav parse_wav(std::span<const std::uint8_t> bytes);
 Wav read_wav(const std::string & path);
+
+// Windowed-sinc resampling (Blackman, 32 taps each side, cutoff at the lower
+// Nyquist). Good enough for a speaker reference; not for the synthesis path.
+std::vector<float> resample(std::span<const float> pcm, int in_rate, int out_rate);
+// `wav` at `rate`: as is, or resampled.
+Wav to_rate(Wav wav, int rate);
 
 } // namespace navi::audio

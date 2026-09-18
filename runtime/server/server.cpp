@@ -71,11 +71,6 @@ private:
     std::thread thread_;
 };
 
-struct Voice {
-    std::string name;
-    std::vector<float> embedding;
-};
-
 void send_error(httplib::Response & res, int status, const std::string & message, const char * type = "invalid_request_error") {
     Json err;
     Json inner;
@@ -107,14 +102,50 @@ void on_signal(int) { if (g_server) g_server->stop(); }
 
 } // namespace
 
-int run(qwen3tts::Graph & graph, const Options & opt) {
+int run(qwen3tts::Graph & graph, voices::Store & store, const Options & opt) {
     const qwen3tts::Params & params = graph.params();
     httplib::Server svr;
     Worker worker;
-    std::mutex voices_mutex;
-    std::map<std::string, Voice> voices;
-    int next_voice = 1;
     std::mt19937_64 seed_rng{std::random_device{}()};
+    std::mutex rng_mutex;
+    auto random_seed = [&] { std::lock_guard<std::mutex> l(rng_mutex); return seed_rng(); };
+
+    // "default" (and an empty voice) -> the configured default, else voice_1, else the first id.
+    auto resolve_voice = [&](const std::string & id) -> voices::VoicePtr {
+        if (!id.empty() && id != "default") return store.find(id);
+        if (!opt.default_voice.empty()) return store.find(opt.default_voice);
+        if (auto v = store.find("voice_1")) return v;
+        const auto ids = store.ids();
+        return ids.empty() ? nullptr : store.find(ids.front());
+    };
+
+    // Clone `sample` under `name`: same name + same bytes is a no-op, a new
+    // sample under an existing name replaces it. Runs the encoder on the worker.
+    struct CloneResult { voices::VoicePtr voice; const char * status; };
+    auto clone = [&](const std::string & name, std::span<const std::uint8_t> sample, const std::string & ref_text) -> CloneResult {
+        const std::string id = voices::Store::id_for(name);
+        const std::string sha = voices::Store::sha256_hex(sample);
+        if (auto v = store.find(id); v && v->sample_sha256 == sha) return {v, "exists"};
+        const auto wav = audio::to_rate(audio::parse_wav(sample), params.spk_sample_rate);
+        if (wav.pcm.size() < static_cast<std::size_t>(params.spk_sample_rate) / 2) throw std::invalid_argument("reference audio is shorter than 0.5 s");
+        voices::Voice v;
+        v.id = id;
+        v.name = name;
+        v.ref_text = ref_text;
+        v.model = opt.model_id;
+        v.sample_sha256 = sha;
+        v.sample_seconds = static_cast<double>(wav.pcm.size()) / wav.sample_rate;
+        const bool replaced = store.find(id) != nullptr;
+        const auto t0 = std::chrono::steady_clock::now();
+        worker.run([&] { v.embedding = graph.embed_speaker(wav.pcm); });
+        auto ptr = store.put(std::move(v), sample);
+        if (opt.verbose) {
+            std::fprintf(stderr, "voice %s%s: %.1f s of audio, %.0f ms\n", id.c_str(), replaced ? " (replaced)" : "",
+                         ptr->sample_seconds,
+                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+        }
+        return {ptr, replaced ? "replaced" : "created"};
+    };
 
     svr.set_payload_max_length(64u << 20);
     svr.set_read_timeout(60);
@@ -151,11 +182,9 @@ int run(qwen3tts::Graph & graph, const Options & opt) {
     });
 
     svr.Get("/v1/audio/voices", [&](const httplib::Request &, httplib::Response & res) {
-        Json::Array list{Json("default")};
-        {
-            std::lock_guard<std::mutex> l(voices_mutex);
-            for (const auto & [id, v] : voices) list.push_back(Json(id));
-        }
+        Json::Array list;
+        if (resolve_voice("default")) list.push_back(Json("default"));
+        for (const auto & id : store.ids()) list.push_back(Json(id));
         Json j;
         j.set(opt.model_id, list);
         res.set_content(j.dump(), "application/json");
@@ -163,9 +192,10 @@ int run(qwen3tts::Graph & graph, const Options & opt) {
 
     svr.Post("/v1/audio/voices", [&](const httplib::Request & req, httplib::Response & res) {
         try {
-            std::string name;
+            std::string name, ref_text;
             if (req.has_param("name")) name = req.get_param_value("name");
             if (req.form.has_field("name")) name = req.form.get_field("name");
+            if (req.form.has_field("ref_text")) ref_text = req.form.get_field("ref_text");
             httplib::FormData file;
             bool have_file = false;
             for (const char * field : {"audio_sample", "audio", "file", "wav_file"}) {
@@ -173,38 +203,20 @@ int run(qwen3tts::Graph & graph, const Options & opt) {
             }
             if (!have_file) { send_error(res, 400, "multipart field 'audio_sample' (or 'audio') with the reference WAV is required"); return; }
             if (name.empty()) name = file.filename.empty() ? "voice" : file.filename;
-            const auto wav = audio::parse_wav(std::span<const std::uint8_t>(
-                reinterpret_cast<const std::uint8_t *>(file.content.data()), file.content.size()));
-            if (wav.sample_rate != params.spk_sample_rate) {
-                send_error(res, 400, "reference audio is " + std::to_string(wav.sample_rate) + " Hz; " +
-                                     std::to_string(params.spk_sample_rate) + " Hz mono is required");
-                return;
-            }
-            std::vector<float> emb;
-            const auto t0 = std::chrono::steady_clock::now();
-            worker.run([&] { emb = graph.embed_speaker(wav.pcm); });
-            std::string id;
-            {
-                std::lock_guard<std::mutex> l(voices_mutex);
-                id = "voice_" + std::to_string(next_voice++);
-                voices[id] = Voice{name, std::move(emb)};
-            }
-            if (opt.verbose) {
-                std::fprintf(stderr, "voice %s '%s': %.1f s of audio, %.0f ms\n", id.c_str(), name.c_str(),
-                             static_cast<double>(wav.pcm.size()) / wav.sample_rate,
-                             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
-            }
+            const auto r = clone(name, std::span<const std::uint8_t>(
+                reinterpret_cast<const std::uint8_t *>(file.content.data()), file.content.size()), ref_text);
             Json j;
-            j.set("id", id); j.set("name", name);
+            j.set("id", r.voice->id); j.set("name", r.voice->name); j.set("status", r.status);
             res.set_content(j.dump(), "application/json");
+        } catch (const navi::Error & e) {
+            send_error(res, 500, e.what(), "engine_error");
         } catch (const std::exception & e) {
             send_error(res, 400, e.what());
         }
     });
 
     svr.Delete(R"(/v1/audio/voices/(.+))", [&](const httplib::Request & req, httplib::Response & res) {
-        std::lock_guard<std::mutex> l(voices_mutex);
-        if (voices.erase(req.matches[1]) == 0) { send_error(res, 404, "no such voice"); return; }
+        if (!store.remove(req.matches[1])) { send_error(res, 404, "no such voice"); return; }
         Json j;
         j.set("deleted", true);
         res.set_content(j.dump(), "application/json");
@@ -225,18 +237,14 @@ int run(qwen3tts::Graph & graph, const Options & opt) {
                 send_error(res, 400, "unknown language '" + body.str_or("language", "") + "'"); return;
             }
             const std::string voice_id = body.str_or("voice", "default");
-            {
-                std::lock_guard<std::mutex> l(voices_mutex);
-                auto it = voices.find(voice_id);
-                if (it == voices.end() && voice_id == "default" && !voices.empty()) it = voices.begin();
-                if (it == voices.end()) {
-                    send_error(res, 400, voices.empty() ? "no voices registered: POST /v1/audio/voices a reference WAV first"
-                                                        : "unknown voice '" + voice_id + "'");
-                    return;
-                }
-                sr.speaker = it->second.embedding;   // the store is append-only while serving; the span stays valid
+            const voices::VoicePtr voice = resolve_voice(voice_id);   // held for the request: a replace/delete cannot free it
+            if (!voice) {
+                send_error(res, 400, store.size() == 0 ? "no voices registered: POST /v1/audio/voices a reference WAV first"
+                                                       : "unknown voice '" + voice_id + "'");
+                return;
             }
-            sr.seed = body.find("seed") ? static_cast<std::uint64_t>(body.get("seed").as_int()) : seed_rng();
+            sr.speaker = voice->embedding;
+            sr.seed = body.find("seed") ? static_cast<std::uint64_t>(body.get("seed").as_int()) : random_seed();
             sr.max_frames = static_cast<int>(body.int_or("max_audio_tokens", opt.max_audio_tokens));
             if (sr.max_frames < 1 || sr.max_frames > 4096) { send_error(res, 400, "'max_audio_tokens' out of range"); return; }
             sr.sampling.temperature = static_cast<float>(body.num_or("temperature", params.temperature));
@@ -268,7 +276,8 @@ int run(qwen3tts::Graph & graph, const Options & opt) {
     g_server = &svr;
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
-    std::fprintf(stderr, "navi-tts serving %s on http://%s:%d\n", opt.model_id.c_str(), opt.host.c_str(), opt.port);
+    std::fprintf(stderr, "navi-tts serving %s on http://%s:%d, %zu voice(s) in %s\n", opt.model_id.c_str(), opt.host.c_str(),
+                 opt.port, store.size(), store.dir().c_str());
     const bool ok = svr.listen(opt.host, opt.port);
     g_server = nullptr;
     if (!ok) { std::fprintf(stderr, "navi-tts: cannot listen on %s:%d\n", opt.host.c_str(), opt.port); return 1; }

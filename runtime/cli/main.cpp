@@ -1,13 +1,15 @@
 // navi-tts: one binary. Subcommands:
 //   info   [--model FILE] [--upload]   device report; with a model, the tensor table check
 //   bench  --model FILE [--out FILE]   the harness (DESIGN 7); JSON line to stdout or appended to --out
-//   serve                              M1+
+//   serve  --model FILE [--voices DIR]  the HTTP front (DESIGN 3)
+//   voices --voices DIR list|add|rm     the persistent voice store, offline (one-time imports)
 
 #include "model/qwen3tts/graph.h"
 #include "model/qwen3tts/params.h"
 #include "runtime/audio/wav.h"
 #include "runtime/common/npy.h"
 #include "runtime/server/server.h"
+#include "runtime/voices/store.h"
 #include "navi/build_info.h"
 #include "runtime/bench/bench.h"
 #include "runtime/common/error.h"
@@ -17,8 +19,10 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -37,6 +41,12 @@ struct Args {
     bool greedy = false;
     std::string host = "127.0.0.1";
     int port = 8080;
+    std::string voices_dir;     // default: $XDG_DATA_HOME/navi-tts/voices
+    std::string default_voice;
+    std::string model_id;
+    std::string name;           // voices add
+    std::string ref_text;
+    std::vector<std::string> rest;   // positional: voices <action> [id]
     bool upload = false;
     bool verbose = false;
     int repeats = 1;
@@ -48,8 +58,12 @@ int usage(const char * argv0) {
         "usage: %s info  [--model FILE] [--upload] [-v]\n"
         "       %s bench --model FILE [--out results.jsonl] [--repeats N]\n"
         "       %s synth --model FILE --text TEXT (--voice REF.wav | --speaker EMB.npy) --out out.wav [--seed N] [--language L] [--max-frames N] [--greedy]\n"
-        "       %s serve --model FILE [--host 127.0.0.1] [--port 8080] [--max-frames 600] [-V]\n",
-        NAVI_GIT_HASH, NAVI_GPU_ARCHS, NAVI_ROCM_VERSION, NAVI_BUILD_TYPE, argv0, argv0, argv0, argv0);
+        "       %s serve --model FILE [--voices DIR] [--default-voice ID] [--model-id ID] [--host 127.0.0.1] [--port 8080] [--max-frames 600] [-V]\n"
+        "       %s voices [--voices DIR] list\n"
+        "       %s voices [--voices DIR] add --model FILE --name NAME --voice REF.wav [--ref-text TEXT]\n"
+        "       %s voices [--voices DIR] rm ID\n"
+        "  --voices defaults to $XDG_DATA_HOME/navi-tts/voices (~/.local/share/navi-tts/voices)\n",
+        NAVI_GIT_HASH, NAVI_GPU_ARCHS, NAVI_ROCM_VERSION, NAVI_BUILD_TYPE, argv0, argv0, argv0, argv0, argv0, argv0, argv0);
     return 2;
 }
 
@@ -76,10 +90,33 @@ Args parse(int argc, char ** argv) {
         else if (s == "--host") a.host = next("--host");
         else if (s == "--port") a.port = std::stoi(next("--port"));
         else if (s == "--upload") a.upload = true;
+        else if (s == "--voices") a.voices_dir = next("--voices");
+        else if (s == "--default-voice") a.default_voice = next("--default-voice");
+        else if (s == "--model-id") a.model_id = next("--model-id");
+        else if (s == "--name") a.name = next("--name");
+        else if (s == "--ref-text") a.ref_text = next("--ref-text");
         else if (s == "-v" || s == "-V" || s == "--verbose") a.verbose = true;
+        else if (!s.empty() && s[0] != '-') a.rest.push_back(s);
         else navi::fail("unknown argument " + s);
     }
+    if (a.voices_dir.empty()) {
+        const char * xdg = std::getenv("XDG_DATA_HOME");
+        const char * home = std::getenv("HOME");
+        if (xdg && *xdg) a.voices_dir = std::string(xdg) + "/navi-tts/voices";
+        else if (home && *home) a.voices_dir = std::string(home) + "/.local/share/navi-tts/voices";
+        else a.voices_dir = "voices";
+    }
+    if (a.model_id.empty() && !a.model.empty()) {
+        std::string base = a.model.substr(a.model.find_last_of('/') == std::string::npos ? 0 : a.model.find_last_of('/') + 1);
+        if (base.size() > 5 && base.compare(base.size() - 5, 5, ".navi") == 0) base.resize(base.size() - 5);
+        a.model_id = base;
+    }
     return a;
+}
+
+// Reference WAV -> mono PCM at the speaker encoder's rate.
+navi::audio::Wav read_reference(const std::string & path, const navi::qwen3tts::Params & p) {
+    return navi::audio::to_rate(navi::audio::read_wav(path), p.spk_sample_rate);
 }
 
 void print_device(const navi::DeviceInfo & d, bool selected) {
@@ -202,12 +239,7 @@ int cmd_synth(const Args & a) {
     const double load_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     std::vector<float> spk;
     if (!a.voice.empty()) {
-        const auto wav = navi::audio::read_wav(a.voice);
-        if (wav.sample_rate != graph->params().spk_sample_rate) {
-            navi::fail(a.voice + " is " + std::to_string(wav.sample_rate) + " Hz; the reference must be " +
-                       std::to_string(graph->params().spk_sample_rate) + " Hz (ffmpeg -ar 24000 -ac 1)");
-        }
-        spk = graph->embed_speaker(wav.pcm);
+        spk = graph->embed_speaker(read_reference(a.voice, graph->params()).pcm);
     } else {
         spk = navi::Npy::load(a.speaker).as_f32();
     }
@@ -244,10 +276,58 @@ int cmd_serve(const Args & a) {
     opt.port = a.port;
     opt.verbose = a.verbose;
     opt.max_audio_tokens = a.max_frames;
-    std::string base = a.model.substr(a.model.find_last_of('/') == std::string::npos ? 0 : a.model.find_last_of('/') + 1);
-    if (base.size() > 5 && base.compare(base.size() - 5, 5, ".navi") == 0) base.resize(base.size() - 5);
-    opt.model_id = base;
-    return navi::server::run(*graph, opt);
+    opt.model_id = a.model_id;
+    opt.default_voice = a.default_voice;
+    navi::voices::Store store = navi::voices::Store::open(a.voices_dir, graph->params().talker.hidden);
+    return navi::server::run(*graph, store, opt);
+}
+
+int cmd_voices(const Args & a) {
+    const std::string action = a.rest.empty() ? "list" : a.rest[0];
+    if (action == "list") {
+        navi::voices::Store store = navi::voices::Store::open(a.voices_dir, 0);   // no model: any embedding size
+        for (const auto & v : store.all()) {
+            std::printf("%-28s %-28s %5.1f s  %zu-d  %s  %s\n", v->id.c_str(), v->name.c_str(), v->sample_seconds,
+                        v->embedding.size(), v->created.c_str(), v->model.c_str());
+        }
+        return 0;
+    }
+    if (action == "rm") {
+        if (a.rest.size() < 2) navi::fail("voices rm needs an id");
+        navi::voices::Store store = navi::voices::Store::open(a.voices_dir, 0);
+        if (!store.remove(a.rest[1])) navi::fail("no such voice " + a.rest[1]);
+        std::printf("removed %s\n", a.rest[1].c_str());
+        return 0;
+    }
+    if (action == "add") {
+        if (a.model.empty() || a.name.empty() || a.voice.empty()) navi::fail("voices add needs --model, --name and --voice");
+        navi::Device dev = navi::Device::open();
+        auto graph = navi::qwen3tts::Graph::load(dev, a.model);
+        navi::voices::Store store = navi::voices::Store::open(a.voices_dir, graph->params().talker.hidden);
+        std::ifstream f(a.voice, std::ios::binary);
+        if (!f) navi::fail("cannot read " + a.voice);
+        const std::string bytes((std::istreambuf_iterator<char>(f)), {});
+        const std::span<const std::uint8_t> sample(reinterpret_cast<const std::uint8_t *>(bytes.data()), bytes.size());
+        navi::voices::Voice v;
+        v.id = navi::voices::Store::id_for(a.name);
+        v.name = a.name;
+        v.ref_text = a.ref_text;
+        v.model = a.model_id;
+        v.sample_sha256 = navi::voices::Store::sha256_hex(sample);
+        if (auto cur = store.find(v.id); cur && cur->sample_sha256 == v.sample_sha256) {
+            std::printf("%s: unchanged\n", v.id.c_str());
+            return 0;
+        }
+        const auto wav = navi::audio::to_rate(navi::audio::parse_wav(sample), graph->params().spk_sample_rate);
+        v.sample_seconds = static_cast<double>(wav.pcm.size()) / wav.sample_rate;
+        const bool replaced = store.find(v.id) != nullptr;
+        v.embedding = graph->embed_speaker(wav.pcm);
+        store.put(std::move(v), sample);
+        std::printf("%s: %s (%.1f s of audio) -> %s\n", navi::voices::Store::id_for(a.name).c_str(),
+                    replaced ? "replaced" : "added", static_cast<double>(wav.pcm.size()) / wav.sample_rate, a.voices_dir.c_str());
+        return 0;
+    }
+    navi::fail("voices: unknown action " + action + " (list|add|rm)");
 }
 
 } // namespace
@@ -259,6 +339,7 @@ int main(int argc, char ** argv) {
         if (a.cmd == "bench") return cmd_bench(a);
         if (a.cmd == "synth") return cmd_synth(a);
         if (a.cmd == "serve") return cmd_serve(a);
+        if (a.cmd == "voices") return cmd_voices(a);
         return usage(argv[0]);
     } catch (const navi::Error & e) {
         std::fprintf(stderr, "navi-tts: %s\n", e.what());
