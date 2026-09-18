@@ -23,7 +23,7 @@ constexpr int MAX_LAYERS = 32;
 constexpr int CP_MAX_LAYERS = 8;
 constexpr int CP_POS = 16;          // hidden, cb0, then 14 fed-back codes
 constexpr int CP_HEADS = 15;        // codebooks 1..15
-constexpr int VEC_MAX = 4096;       // largest LDS vector: ff 3072, vocab 3072 padded to 4096 for the sort
+constexpr int VEC_MAX = 4096;       // largest LDS vector: ff 3072, vocab 3072
 constexpr int MV_ROWS = 4;
 
 struct TlParams { int hidden, n_head, n_kv_head, head_dim, ff, vocab, n_layer; float eps, rope_theta; };
@@ -205,36 +205,97 @@ __device__ int block_argmax(const float * v, int n, float * red) {
     return r;
 }
 
-// Multinomial draw over probabilities p[0..V) (unnormalised, sum given) with
-// PCG32 seeded from `seed`; thread 0 only.
-__device__ __forceinline__ int draw(const float * p, int V, float inv_sum, uint64_t seed) {
-    uint64_t st = seed * 0x9E3779B97F4A7C15ull + 0xBF58476D1CE4E5B9ull + 1ull;
-    (void) pcg32_next(st); (void) pcg32_next(st); (void) pcg32_next(st);
-    const float u = static_cast<float>(pcg32_next(st) >> 8) * (1.0f / 16777216.0f);
-    float cum = 0.f;
-    int chosen = V - 1;
-    for (int i = 0; i < V; ++i) {
-        cum += p[i] * inv_sum;
-        if (cum >= u) { chosen = i; break; }
-    }
-    return chosen;
+// Sampling scratch: the top-k threshold by radix select and the multinomial
+// draw over the candidates only. One block (block 0), BLOCK threads.
+struct SampleScratch {
+    unsigned hist[256];   // one 8-bit digit's histogram
+    int idx[VEC_MAX];     // candidate indices, in order
+};
+
+// float -> monotone unsigned key: larger float, larger key
+__device__ __forceinline__ unsigned float_key(float f) {
+    const unsigned u = __float_as_uint(f);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+__device__ __forceinline__ float key_float(unsigned u) {
+    return __uint_as_float((u & 0x80000000u) ? (u & 0x7FFFFFFFu) : ~u);
 }
 
-// Bitonic sort (descending) of xs[0..N), N a power of two, whole block.
-__device__ void block_sort_desc(float * xs, int N) {
-    for (int k = 2; k <= N; k <<= 1) {
-        for (int j = k >> 1; j > 0; j >>= 1) {
-            __syncthreads();
-            for (int i = threadIdx.x; i < (N >> 1); i += blockDim.x) {
-                const int l = ((i & ~(j - 1)) << 1) | (i & (j - 1));
-                const int m = l + j;
-                const bool desc = (l & k) == 0;
-                const float x = xs[l], y = xs[m];
-                if (desc ? (x < y) : (x > y)) { xs[l] = y; xs[m] = x; }
-            }
+// The k-th largest of xs[0..V) (1 <= k <= V), exactly: four 8-bit radix
+// passes, each a 256-bin histogram walked in parallel (one thread per bin,
+// wave scans from the top digit down). Ties at the threshold are the
+// caller's business, as they were with a sort. red: >= 12 ints.
+__device__ float block_kth_largest(const float * xs, int V, int k, unsigned * hist, float * redf) {
+    int * red = reinterpret_cast<int *>(redf);
+    const int lane = threadIdx.x % warpSize, wid = threadIdx.x / warpSize;
+    unsigned prefix = 0, mask = 0;
+    int need = k;
+    for (int pass = 3; pass >= 0; --pass) {
+        const int shift = pass * 8;
+        for (int i = threadIdx.x; i < 256; i += blockDim.x) hist[i] = 0;
+        __syncthreads();
+        for (int i = threadIdx.x; i < V; i += blockDim.x) {
+            const unsigned key = float_key(xs[i]);
+            if ((key & mask) == prefix) atomicAdd(&hist[(key >> shift) & 0xFFu], 1u);
+        }
+        __syncthreads();
+        // thread t owns digit 255 - t; `above` = keys with a larger digit
+        const int d = 255 - static_cast<int>(threadIdx.x);
+        const int c = static_cast<int>(hist[d]);
+        int incl = c;
+        for (int o = 1; o < warpSize; o <<= 1) { const int v = __shfl_up(incl, o, warpSize); if (lane >= o) incl += v; }
+        if (lane == warpSize - 1) red[wid] = incl;
+        __syncthreads();
+        int above = incl - c;
+        for (int w = 0; w < wid; ++w) above += red[w];
+        if (above < need && above + c >= need) { red[8] = d; red[9] = need - above; }
+        __syncthreads();
+        need = red[9];
+        prefix |= static_cast<unsigned>(red[8]) << shift;
+        mask |= 0xFFu << shift;
+        __syncthreads();
+    }
+    return key_float(prefix);
+}
+
+// Multinomial draw over probabilities p[0..V) (unnormalised, sum given),
+// PCG32 seeded from `seed`. Only the nonzero entries are visited, in index
+// order: adding an exact zero leaves the running sum unchanged, so this is
+// bit-identical to walking all of p, but thread 0 walks <= top_k entries.
+// Returns the index on thread 0 (garbage elsewhere). red: >= 12 ints.
+__device__ int block_draw(const float * p, int V, float inv_sum, uint64_t seed, int * idx, float * redf) {
+    int * red = reinterpret_cast<int *>(redf);
+    const int lane = threadIdx.x % warpSize, wid = threadIdx.x / warpSize, nw = blockDim.x / warpSize;
+    if (threadIdx.x == 0) red[0] = 0;
+    __syncthreads();
+    for (int base = 0; base < V; base += blockDim.x) {
+        const int i = base + threadIdx.x;
+        const bool nz = i < V && p[i] != 0.f;
+        const unsigned long long m = __ballot(nz);
+        const int in_wave = __popcll(m & ((1ull << lane) - 1ull));
+        if (lane == 0) red[1 + wid] = __popcll(m);
+        __syncthreads();
+        int before = red[0];
+        for (int w = 0; w < wid; ++w) before += red[1 + w];
+        if (nz) idx[before + in_wave] = i;
+        __syncthreads();
+        if (threadIdx.x == 0) { int t = 0; for (int w = 0; w < nw; ++w) t += red[1 + w]; red[0] += t; }
+        __syncthreads();
+    }
+    int chosen = V - 1;
+    if (threadIdx.x == 0) {
+        uint64_t st = seed * 0x9E3779B97F4A7C15ull + 0xBF58476D1CE4E5B9ull + 1ull;
+        (void) pcg32_next(st); (void) pcg32_next(st); (void) pcg32_next(st);
+        const float u = static_cast<float>(pcg32_next(st) >> 8) * (1.0f / 16777216.0f);
+        const int n = red[0];
+        float cum = 0.f;
+        for (int j = 0; j < n; ++j) {
+            const int i = idx[j];
+            cum += p[i] * inv_sum;
+            if (cum >= u) { chosen = i; break; }
         }
     }
-    __syncthreads();
+    return chosen;
 }
 
 // --- talker phases ----------------------------------------------------------
@@ -355,7 +416,7 @@ __device__ __forceinline__ float tl_modified_logit(const Work & B, int i) {
 
 // Block 0 samples cb0 into codes[0]: greedy if temperature <= 0, else
 // temperature, top-k threshold (bitonic sort), softmax, multinomial.
-__device__ void tl_sample(const TlParams & P, const Work & B, float * xs, float * red) {
+__device__ void tl_sample(const TlParams & P, const Work & B, float * xs, float * red, SampleScratch & S) {
     if (blockIdx.x != 0) return;
     const int V = P.vocab;
     if (B.temperature <= 0.f) {
@@ -365,19 +426,11 @@ __device__ void tl_sample(const TlParams & P, const Work & B, float * xs, float 
         if (threadIdx.x == 0) { B.codes[0] = best; if (best != B.eos_id) B.seen[best] = 1u; }
         return;
     }
-    const int N = VEC_MAX;
-    for (int i = threadIdx.x; i < N; i += blockDim.x) xs[i] = (i < V) ? tl_modified_logit(B, i) / B.temperature : -INFINITY;
+    float m = -INFINITY;
+    for (int i = threadIdx.x; i < V; i += blockDim.x) { xs[i] = tl_modified_logit(B, i) / B.temperature; m = fmaxf(m, xs[i]); }
+    const float mx = dev::block_max(m, red);
     __syncthreads();
-    float threshold = -INFINITY, mx;
-    if (B.top_k > 0 && B.top_k < V) {
-        block_sort_desc(xs, N);
-        threshold = xs[B.top_k - 1];
-        mx = xs[0];
-    } else {
-        float m = -INFINITY;
-        for (int i = threadIdx.x; i < V; i += blockDim.x) m = fmaxf(m, xs[i]);
-        mx = dev::block_max(m, red);
-    }
+    const float threshold = (B.top_k > 0 && B.top_k < V) ? block_kth_largest(xs, V, B.top_k, S.hist, red) : -INFINITY;
     __syncthreads();
     float ssum = 0.f;
     for (int i = threadIdx.x; i < V; i += blockDim.x) {
@@ -388,8 +441,8 @@ __device__ void tl_sample(const TlParams & P, const Work & B, float * xs, float 
     }
     ssum = dev::block_sum(ssum, red);
     __syncthreads();
+    const int chosen = block_draw(xs, V, 1.f / ssum, B.talker_seed, S.idx, red);
     if (threadIdx.x == 0) {
-        const int chosen = draw(xs, V, 1.f / ssum, B.talker_seed);
         B.codes[0] = chosen;
         if (chosen != B.eos_id) B.seen[chosen] = 1u;
     }
@@ -413,7 +466,7 @@ __device__ void cp_head(const CpParams & P, const CpWeights & W, const Work & B,
 }
 
 // Block 0 samples codebook `pos` from head pos-1 into codes[pos].
-__device__ void cp_sample(const CpParams & P, const Work & B, int pos, float * xs, float * red) {
+__device__ void cp_sample(const CpParams & P, const Work & B, int pos, float * xs, float * red, SampleScratch & S) {
     if (pos < 1 || blockIdx.x != 0) return;
     const int V = P.vocab;
     const float * lg = B.clogits + static_cast<size_t>(pos - 1) * V;
@@ -422,18 +475,11 @@ __device__ void cp_sample(const CpParams & P, const Work & B, int pos, float * x
         if (threadIdx.x == 0) B.codes[pos] = best;
         return;
     }
-    for (int i = threadIdx.x; i < V; i += blockDim.x) xs[i] = lg[i] / B.cp_temperature;
+    float m = -INFINITY;
+    for (int i = threadIdx.x; i < V; i += blockDim.x) { xs[i] = lg[i] / B.cp_temperature; m = fmaxf(m, xs[i]); }
+    const float mx = dev::block_max(m, red);
     __syncthreads();
-    float threshold = -INFINITY, mx;
-    if (B.cp_top_k > 0 && B.cp_top_k < V) {
-        block_sort_desc(xs, V);   // 2048 is a power of two
-        threshold = xs[B.cp_top_k - 1];
-        mx = xs[0];
-    } else {
-        float m = -INFINITY;
-        for (int i = threadIdx.x; i < V; i += blockDim.x) m = fmaxf(m, xs[i]);
-        mx = dev::block_max(m, red);
-    }
+    const float threshold = (B.cp_top_k > 0 && B.cp_top_k < V) ? block_kth_largest(xs, V, B.cp_top_k, S.hist, red) : -INFINITY;
     __syncthreads();
     float ssum = 0.f;
     for (int i = threadIdx.x; i < V; i += blockDim.x) {
@@ -444,9 +490,11 @@ __device__ void cp_sample(const CpParams & P, const Work & B, int pos, float * x
     }
     ssum = dev::block_sum(ssum, red);
     __syncthreads();
-    if (threadIdx.x == 0) B.codes[pos] = draw(xs, V, 1.f / ssum, B.cp_seed + static_cast<uint64_t>(pos) * 0xD1B54A32D192ED03ull);
+    const int chosen = block_draw(xs, V, 1.f / ssum, B.cp_seed + static_cast<uint64_t>(pos) * 0xD1B54A32D192ED03ull, S.idx, red);
+    if (threadIdx.x == 0) B.codes[pos] = chosen;
     __syncthreads();
 }
+
 
 // next frame's step embedding: codec_embd[cb0] + sum_cb cp_embd[cb][code] + trailing
 __device__ void assemble_step(const CpParams & P, const CpWeights & W, const Work & B) {
@@ -465,6 +513,7 @@ __device__ void assemble_step(const CpParams & P, const CpWeights & W, const Wor
 __global__ void __launch_bounds__(BLOCK) k_frame(TlParams TP, TlWeights TW, CpParams CP, CpWeights CW, Work B) {
     __shared__ float xs[VEC_MAX];
     __shared__ float red[32];
+    __shared__ SampleScratch samp;
     const unsigned nb = gridDim.x;
 #define GBSYNC() do { if (!grid_barrier(B.bar, nb, B.spin_cap)) return; } while (0)
 
@@ -489,7 +538,7 @@ __global__ void __launch_bounds__(BLOCK) k_frame(TlParams TP, TlWeights TW, CpPa
         }
         tl_head(TP, TW, B, xs, red);                                                                          GBSYNC();
     }
-    tl_sample(TP, B, xs, red);                                                                                GBSYNC();
+    tl_sample(TP, B, xs, red, samp);                                                                          GBSYNC();
 
     const int ckv = CP.n_kv_head * CP.head_dim;
     for (int pos = 0; pos < CP_POS; ++pos) {
@@ -511,7 +560,7 @@ __global__ void __launch_bounds__(BLOCK) k_frame(TlParams TP, TlWeights TW, CpPa
             grid_matvec<true>(CW.w_down[il], CP.hidden, CP.ff, xs, B.cx);                                     GBSYNC();
         }
         cp_head(CP, CW, B, pos, xs, red);                                                                     GBSYNC();
-        cp_sample(CP, B, pos, xs, red);                                                                       GBSYNC();
+        cp_sample(CP, B, pos, xs, red, samp);                                                                 GBSYNC();
     }
     assemble_step(CP, CW, B);
     GBSYNC();
