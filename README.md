@@ -48,7 +48,10 @@ the weight file.
 - **Model:** Qwen3-TTS architecture (0.6B), own weight format converted offline.
   Fine-tunes of the same architecture are just different weights.
 - **API:** OpenAI-compatible `/v1/audio/speech` and `/v1/audio/voices` on `:8080`,
-  plus the XTTS dialect SkyrimNet speaks. Cloned voices persist across restarts.
+  plus the XTTS dialect SkyrimNet speaks (`/create_and_store_latents`,
+  `/tts_to_audio/`, `/speakers`, ...) on the same port and, with
+  `--xtts-port 8020`, on the port SkyrimNet's `XTTS.yaml` already names.
+  Cloned voices persist across restarts.
 - **Serves:** [TTS-Player](../TTS-Player) (queue, Claude Code / opencode cues) and SkyrimNet.
 
 ## Lineage

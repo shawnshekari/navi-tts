@@ -41,6 +41,8 @@ struct Args {
     bool greedy = false;
     std::string host = "127.0.0.1";
     int port = 8080;
+    int xtts_port = 0;
+    std::string xtts_fallback_male = "default", xtts_fallback_female = "default";
     std::string voices_dir;     // default: $XDG_DATA_HOME/navi-tts/voices
     std::string default_voice;
     std::string model_id;
@@ -58,7 +60,7 @@ int usage(const char * argv0) {
         "usage: %s info  [--model FILE] [--upload] [-v]\n"
         "       %s bench --model FILE [--out results.jsonl] [--repeats N]\n"
         "       %s synth --model FILE --text TEXT (--voice REF.wav | --speaker EMB.npy) --out out.wav [--seed N] [--language L] [--max-frames N] [--greedy]\n"
-        "       %s serve --model FILE [--voices DIR] [--default-voice ID] [--model-id ID] [--host 127.0.0.1] [--port 8080] [--max-frames 600] [-V]\n"
+        "       %s serve --model FILE [--voices DIR] [--default-voice ID] [--model-id ID] [--host 127.0.0.1] [--port 8080] [--xtts-port 8020] [--xtts-fallback-male ID] [--xtts-fallback-female ID] [--max-frames 600] [-V]\n"
         "       %s voices [--voices DIR] list\n"
         "       %s voices [--voices DIR] add --model FILE --name NAME --voice REF.wav [--ref-text TEXT]\n"
         "       %s voices [--voices DIR] rm ID\n"
@@ -89,6 +91,9 @@ Args parse(int argc, char ** argv) {
         else if (s == "--greedy") a.greedy = true;
         else if (s == "--host") a.host = next("--host");
         else if (s == "--port") a.port = std::stoi(next("--port"));
+        else if (s == "--xtts-port") a.xtts_port = std::stoi(next("--xtts-port"));
+        else if (s == "--xtts-fallback-male") a.xtts_fallback_male = next("--xtts-fallback-male");
+        else if (s == "--xtts-fallback-female") a.xtts_fallback_female = next("--xtts-fallback-female");
         else if (s == "--upload") a.upload = true;
         else if (s == "--voices") a.voices_dir = next("--voices");
         else if (s == "--default-voice") a.default_voice = next("--default-voice");
@@ -274,6 +279,9 @@ int cmd_serve(const Args & a) {
     navi::server::Options opt;
     opt.host = a.host;
     opt.port = a.port;
+    opt.xtts_port = a.xtts_port;
+    opt.xtts_fallback_male = a.xtts_fallback_male;
+    opt.xtts_fallback_female = a.xtts_fallback_female;
     opt.verbose = a.verbose;
     opt.max_audio_tokens = a.max_frames;
     opt.model_id = a.model_id;
