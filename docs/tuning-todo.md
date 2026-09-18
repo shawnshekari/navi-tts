@@ -92,12 +92,18 @@ The cap is a constant today (`frame.hip:70`, `B.spin_cap = opt.spin_cap`).
 
 ## M4 — not next, but the shape is known
 
-- **int8 code-predictor weights.** The only real lever left on the frame
-  itself: 2.4 of the 3.3 GB streamed per frame is the code predictor, streamed
-  15×. Halving it puts the frame near ~4 ms and RTF near ~0.073. **Not
-  bit-exact** — a model change, needs the listen test, a ≥60 dB SNR parity
-  number (§6.3) and a new reference sha. Re-measure on gfx1151 too: the XTX
-  ruled quantised GEMV out for the talker, Strix may not.
+- **int8 weights.** Measured 2026-09-18 (`bench/micro/matvec.hip`, frame-8
+  profile): the frame is 6.0 ms of which matvec phases are 4.7 (code
+  predictor 3.5, talker 1.2). int8 with block-32 scales runs the matvec at
+  0.55× f16's time, not 0.5× — the convert per byte makes it VALU-bound
+  unless activations go int8 too (v_dot4). Projection: **cp only → frame
+  ~4.5 ms, RTF ~0.066 (−23 %); cp + talker → ~3.9 / ~0.059 (−30 %)**;
+  ceiling ~0.056. TTFA barely moves. VRAM 1.96 → ~1.2 GB. Cost: converter
+  quantiser + `.navi` dtype, int8 matvec in the frame kernel (every phase),
+  a quality gate — §6.3's ≥60 dB SNR is an f16 gate that int8 will not
+  meet, so a listen test and a new number — and a new reference sha.
+  Worth more on Strix (bandwidth-bound harder) than on the XTX; on the XTX
+  it is headroom under contention, not felt latency. Decide after item 3.
 - **On-device frame loop.** Host tail ~0.1 ms/frame plus TTFA jitter; worth
   ~0.001 RTF, mostly a jitter and a tidiness win.
 - **ICL cloning (tokenizer encoder).** A quality lever, not a perf one
