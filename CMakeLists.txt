@@ -110,8 +110,14 @@ add_library(navi_qwen3tts STATIC
 navi_hip_sources(navi_qwen3tts model/qwen3tts/vocoder.hip model/qwen3tts/talker.hip model/qwen3tts/frame.hip model/qwen3tts/speaker.hip)
 target_link_libraries(navi_qwen3tts PUBLIC navi_runtime)
 
+add_library(navi_server STATIC runtime/server/server.cpp)
+target_link_libraries(navi_server PUBLIC navi_qwen3tts navi_runtime)
+target_compile_definitions(navi_server PRIVATE CPPHTTPLIB_THREAD_POOL_COUNT=4)
+find_package(Threads REQUIRED)
+target_link_libraries(navi_server PUBLIC Threads::Threads)
+
 add_executable(navi-tts runtime/cli/main.cpp)
-target_link_libraries(navi-tts PRIVATE navi_qwen3tts navi_runtime)
+target_link_libraries(navi-tts PRIVATE navi_server navi_qwen3tts navi_runtime)
 
 # --- tests -------------------------------------------------------------------
 # Parity gates against tests/reference (DESIGN 6). They need the converted model.

@@ -7,6 +7,7 @@
 #include "model/qwen3tts/params.h"
 #include "runtime/audio/wav.h"
 #include "runtime/common/npy.h"
+#include "runtime/server/server.h"
 #include "navi/build_info.h"
 #include "runtime/bench/bench.h"
 #include "runtime/common/error.h"
@@ -34,6 +35,8 @@ struct Args {
     std::uint64_t seed = 0;
     int max_frames = 600;
     bool greedy = false;
+    std::string host = "127.0.0.1";
+    int port = 8080;
     bool upload = false;
     bool verbose = false;
     int repeats = 1;
@@ -45,7 +48,7 @@ int usage(const char * argv0) {
         "usage: %s info  [--model FILE] [--upload] [-v]\n"
         "       %s bench --model FILE [--out results.jsonl] [--repeats N]\n"
         "       %s synth --model FILE --text TEXT (--voice REF.wav | --speaker EMB.npy) --out out.wav [--seed N] [--language L] [--max-frames N] [--greedy]\n"
-        "       %s serve ...            (M2)\n",
+        "       %s serve --model FILE [--host 127.0.0.1] [--port 8080] [--max-frames 600] [-V]\n",
         NAVI_GIT_HASH, NAVI_GPU_ARCHS, NAVI_ROCM_VERSION, NAVI_BUILD_TYPE, argv0, argv0, argv0, argv0);
     return 2;
 }
@@ -70,8 +73,10 @@ Args parse(int argc, char ** argv) {
         else if (s == "--seed") a.seed = std::stoull(next("--seed"));
         else if (s == "--max-frames") a.max_frames = std::stoi(next("--max-frames"));
         else if (s == "--greedy") a.greedy = true;
+        else if (s == "--host") a.host = next("--host");
+        else if (s == "--port") a.port = std::stoi(next("--port"));
         else if (s == "--upload") a.upload = true;
-        else if (s == "-v" || s == "--verbose") a.verbose = true;
+        else if (s == "-v" || s == "-V" || s == "--verbose") a.verbose = true;
         else navi::fail("unknown argument " + s);
     }
     return a;
@@ -226,6 +231,25 @@ int cmd_synth(const Args & a) {
     return 0;
 }
 
+int cmd_serve(const Args & a) {
+    if (a.model.empty()) navi::fail("serve needs --model");
+    navi::Device dev = navi::Device::open();
+    const auto t0 = std::chrono::steady_clock::now();
+    auto graph = navi::qwen3tts::Graph::load(dev, a.model);
+    std::fprintf(stderr, "navi-tts %s: %s loaded on %s (%s) in %.0f ms\n", NAVI_GIT_HASH, a.model.c_str(),
+                 dev.info().name.c_str(), dev.info().arch.c_str(),
+                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    navi::server::Options opt;
+    opt.host = a.host;
+    opt.port = a.port;
+    opt.verbose = a.verbose;
+    opt.max_audio_tokens = a.max_frames;
+    std::string base = a.model.substr(a.model.find_last_of('/') == std::string::npos ? 0 : a.model.find_last_of('/') + 1);
+    if (base.size() > 5 && base.compare(base.size() - 5, 5, ".navi") == 0) base.resize(base.size() - 5);
+    opt.model_id = base;
+    return navi::server::run(*graph, opt);
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
@@ -234,7 +258,7 @@ int main(int argc, char ** argv) {
         if (a.cmd == "info") return cmd_info(a);
         if (a.cmd == "bench") return cmd_bench(a);
         if (a.cmd == "synth") return cmd_synth(a);
-        if (a.cmd == "serve") navi::fail("serve arrives at M1");
+        if (a.cmd == "serve") return cmd_serve(a);
         return usage(argv[0]);
     } catch (const navi::Error & e) {
         std::fprintf(stderr, "navi-tts: %s\n", e.what());
