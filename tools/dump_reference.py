@@ -27,6 +27,9 @@ writes what each engine stage is checked against:
   sampled_codes.npy       [n_frames, 16] a seeded sampled run with the model's default sampling:
                           real speech, the fixed code sequence for the vocoder gate
   sampled_pcm.npy         [n_samples] f32 decode of sampled_codes; sampled.wav is the same as s16
+  sampled_pcm_f16w.npy    the same decode with every >=2-D decoder weight rounded to f16 (what the
+                          engine's weights are): the kernel-exactness gate. sampled_pcm.npy vs this
+                          is the quantisation budget, not something the engine can close.
   vocoder16_pcm.npy       decode of the first 16 frames of sampled_codes only
   manifest.json           what produced all of the above
 """
@@ -103,6 +106,33 @@ def load_wav(path: Path, sr_expected: int) -> np.ndarray:
     return wav.mean(axis=1).astype(np.float32)
 
 
+def write_vocoder_refs(model, sampled: np.ndarray, out: Path) -> np.ndarray:
+    """sampled_pcm.npy / sampled.wav (f32 weights), vocoder16_pcm.npy, and sampled_pcm_f16w.npy."""
+    import copy
+    st = model.speech_tokenizer
+    codes = torch.from_numpy(sampled).long()
+    wavs, fs = st.decode([{"audio_codes": codes}])
+    pcm = np.asarray(wavs[0], dtype=np.float32)
+    np.save(out / "sampled_pcm.npy", pcm)
+    sf.write(out / "sampled.wav", pcm, fs, subtype="PCM_16")
+    wavs16, _ = st.decode([{"audio_codes": codes[:16]}])
+    np.save(out / "vocoder16_pcm.npy", np.asarray(wavs16[0], dtype=np.float32))
+
+    # f16-rounded weights, exactly as tools/convert.py stores them: every >=2-D
+    # tensor, with the EMA codebooks baked first and then rounded.
+    dec = copy.deepcopy(st.model.decoder)
+    for name, p in dec.named_parameters():
+        if p.ndim >= 2 and "embedding_sum" not in name:
+            p.data = p.data.half().float()
+    for m in dec.modules():
+        if hasattr(m, "embedding_sum"):
+            usage = m.cluster_usage.clamp(min=m.epsilon)[:, None]
+            m.embedding_sum.data = (m.embedding_sum / usage).half().float() * usage
+    pcm16w = dec(codes.T.unsqueeze(0))[0, 0].numpy().astype(np.float32)
+    np.save(out / "sampled_pcm_f16w.npy", pcm16w)
+    return pcm
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", type=Path, required=True, help="HF model directory")
@@ -117,6 +147,7 @@ def main():
                     help="the model's default; pure argmax (1.0) locks into a 2-frame loop and never emits EOS")
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--tokenizer-only", action="store_true", help="only text_ids.npy and tokenizer_cases.json")
+    ap.add_argument("--vocoder-only", action="store_true", help="only re-decode the existing sampled_codes.npy")
     a = ap.parse_args()
 
     torch.manual_seed(0)
@@ -136,6 +167,11 @@ def main():
     print(f"model loaded in {time.time() - t0:.1f}s", file=sys.stderr)
     cfg = model.config
     tcfg = cfg.talker_config
+
+    if a.vocoder_only:
+        sampled = np.load(out / "sampled_codes.npy")
+        write_vocoder_refs(model, sampled, out)
+        return
 
     # --- tokenizer ---------------------------------------------------------
     prompt_text = tts._build_assistant_text(a.text)
@@ -244,13 +280,8 @@ def main():
 
     # --- vocoder ----------------------------------------------------------------
     t3 = time.time()
-    wavs, fs = model.speech_tokenizer.decode([{"audio_codes": torch.from_numpy(sampled).long()}])
-    pcm = np.asarray(wavs[0], dtype=np.float32)
-    np.save(out / "sampled_pcm.npy", pcm)
-    sf.write(out / "sampled.wav", pcm, fs, subtype="PCM_16")
-    wavs16, _ = model.speech_tokenizer.decode([{"audio_codes": torch.from_numpy(sampled[:16]).long()}])
-    np.save(out / "vocoder16_pcm.npy", np.asarray(wavs16[0], dtype=np.float32))
-    print(f"vocoder: {pcm.shape[0]} samples @ {fs} Hz ({pcm.shape[0] / fs:.2f}s) in {time.time() - t3:.1f}s", file=sys.stderr)
+    pcm = write_vocoder_refs(model, sampled, out)
+    print(f"vocoder: {pcm.shape[0]} samples ({pcm.shape[0] / 24000:.2f}s) in {time.time() - t3:.1f}s", file=sys.stderr)
 
     import importlib.metadata
     import transformers

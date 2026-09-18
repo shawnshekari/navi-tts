@@ -95,6 +95,7 @@ add_library(navi_runtime STATIC
     runtime/text/bpe.cpp
     runtime/weights/navi_file.cpp
     runtime/weights/device_weights.cpp
+    runtime/audio/wav.cpp
     runtime/bench/bench.cpp
 )
 target_include_directories(navi_runtime PUBLIC "${CMAKE_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/generated")
@@ -105,6 +106,7 @@ add_library(navi_qwen3tts STATIC
     model/qwen3tts/params.cpp
     model/qwen3tts/tokenizer.cpp
 )
+navi_hip_sources(navi_qwen3tts model/qwen3tts/vocoder.hip)
 target_link_libraries(navi_qwen3tts PUBLIC navi_runtime)
 
 add_executable(navi-tts runtime/cli/main.cpp)
@@ -117,3 +119,6 @@ enable_testing()
 add_executable(test_tokenizer tests/test_tokenizer.cpp)
 target_link_libraries(test_tokenizer PRIVATE navi_qwen3tts navi_runtime)
 add_test(NAME tokenizer COMMAND test_tokenizer "${NAVI_TEST_MODEL}" "${CMAKE_SOURCE_DIR}/tests/reference/tokenizer_cases.json")
+add_executable(test_vocoder tests/test_vocoder.cpp)
+target_link_libraries(test_vocoder PRIVATE navi_qwen3tts navi_runtime)
+add_test(NAME vocoder COMMAND test_vocoder "${NAVI_TEST_MODEL}" "${CMAKE_SOURCE_DIR}/tests/reference" "${CMAKE_BINARY_DIR}/vocoder_out.wav")
