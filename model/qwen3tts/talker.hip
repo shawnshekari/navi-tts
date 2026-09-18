@@ -5,6 +5,7 @@
 #include "runtime/common/hip_check.h"
 #include "runtime/device/kernel_util.h"
 
+#include <cstdint>
 #include <hip/hip_fp16.h>
 
 #include <cmath>
@@ -142,7 +143,7 @@ struct Talker::Impl {
 
     // prefill scratch
     float * x = nullptr, * n = nullptr, * q = nullptr, * k = nullptr, * v = nullptr, * att = nullptr, * gu = nullptr,
-          * logits = nullptr;
+          * logits = nullptr, * gate_tmp = nullptr;   // gate_tmp: [32][ff], the skinny GEMM's gated input
 
     template <class T> T * alloc(std::size_t n_elems) {
         void * ptr = nullptr;
@@ -157,6 +158,23 @@ struct Talker::Impl {
         ConvArgs a{};
         a.W = W; a.bias = bias; a.x = in; a.T_in = T; a.Cin = Cin; a.Cout = Cout; a.dil = 1;
         a.x_stride = in_stride ? in_stride : Cin; a.phases = 1; a.y = out; a.y_stride = out_stride; a.residual = residual;
+        // T <= 32 (every prefill GEMM): the skinny kernel, with the gate as
+        // its own pass. Same summation order as k_conv - bit-identical.
+        const bool aligned = (Cin % 8 == 0) && (a.x_stride % 4 == 0)
+            && ((reinterpret_cast<std::uintptr_t>(in) | reinterpret_cast<std::uintptr_t>(W)) & 15u) == 0;
+        if (T <= 32 && aligned && (pro == PRO_NONE || pro == PRO_SILU_GATE)
+            && (epi == EPI_NONE || epi == EPI_SILU || epi == EPI_RESIDUAL)) {
+            if (pro == PRO_SILU_GATE) {
+                k_silu_gate<<<T, 256, 0, stream>>>(in, Cin, a.x_stride, gate_tmp);
+                a.x = gate_tmp; a.x_stride = Cin;
+            }
+            const dim3 grid((Cout + SK_ROWS - 1) / SK_ROWS), block(SK_NT);
+            if (epi == EPI_NONE) k_gemm_skinny<EPI_NONE><<<grid, block, 0, stream>>>(a);
+            else if (epi == EPI_SILU) k_gemm_skinny<EPI_SILU><<<grid, block, 0, stream>>>(a);
+            else k_gemm_skinny<EPI_RESIDUAL><<<grid, block, 0, stream>>>(a);
+            NAVI_HIP(hipGetLastError());
+            return;
+        }
         const dim3 grid((T + TT - 1) / TT, (Cout + CT - 1) / CT, 1), block(NTHREADS);
         if (pro == PRO_NONE && epi == EPI_NONE) k_conv<unsigned short, 1, PRO_NONE, EPI_NONE><<<grid, block, 0, stream>>>(a);
         else if (pro == PRO_NONE && epi == EPI_SILU) k_conv<unsigned short, 1, PRO_NONE, EPI_SILU><<<grid, block, 0, stream>>>(a);
@@ -228,6 +246,7 @@ std::unique_ptr<Talker> Talker::create(const Device & dev, const DeviceWeights &
     I.x = I.alloc<float>(M * H); I.n = I.alloc<float>(M * H);
     I.q = I.alloc<float>(M * Q); I.k = I.alloc<float>(M * KV); I.v = I.alloc<float>(M * KV);
     I.att = I.alloc<float>(M * Q); I.gu = I.alloc<float>(M * 2 * F);
+    I.gate_tmp = I.alloc<float>(32 * F);
     I.logits = I.alloc<float>(M * tp.vocab);
     NAVI_HIP(hipEventCreate(&I.ev0));
     NAVI_HIP(hipEventCreate(&I.ev1));

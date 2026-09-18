@@ -242,6 +242,103 @@ __global__ void __launch_bounds__(NTHREADS) k_conv(ConvArgs a) {
 }
 
 
+// ---------------------------------------------------------------------------
+// Skinny GEMM for T <= 32 rows (the talker prefill: a fixed ~10-row prompt
+// against 1024-3072 wide f16 weights, 7 GEMMs x 28 layers). k_conv's 32-row
+// tile is mostly padding there and streams the weights at ~60 GB/s.
+//     y[t][co] = epi(bias[co] + sum_ci W[co][ci] * x[t][ci])
+// Lane t owns row t; a wave owns SK_R output channels; the block's SK_ROWS
+// channels are staged SK_CCH input channels at a time with one 16-byte
+// coalesced load per thread, converted to f32 once, and read back wave-
+// uniform. The sum over ci is sequential per output, as in k_conv, so the
+// two are bit-identical. ~2.2x k_conv at these shapes (bench/micro/
+// gemm_skinny.hip); the shape is fundamentally latency-bound at 1-2 waves
+// per SIMD, which is where the remaining gap to the card's bandwidth sits.
+// PRO is not supported: a gated input is prepared once by k_silu_gate.
+// Requires Cin % 8 == 0, x_stride % 4 == 0, 16-byte aligned x and W (the
+// caller checks and falls back to k_conv).
+// ---------------------------------------------------------------------------
+
+constexpr int SK_R = 2, SK_NW = 4, SK_CCH = 512, SK_NT = SK_NW * 32, SK_ROWS = SK_NW * SK_R;
+
+template <int EPI>
+__global__ void __launch_bounds__(SK_NT) k_gemm_skinny(ConvArgs a) {
+    constexpr int LPT = SK_ROWS * SK_CCH / 8 / SK_NT;   // 16-byte loads per thread per chunk
+    __shared__ __align__(16) float ws[SK_ROWS][SK_CCH];
+    const int tid = threadIdx.x, lane = tid % 32, wave = tid / 32;
+    const int co0 = blockIdx.x * SK_ROWS, t = lane;
+    const bool live = t < a.T_in;
+    const unsigned short * W = static_cast<const unsigned short *>(a.W);
+    const float * xrow = a.x + static_cast<std::size_t>(live ? t : 0) * a.x_stride;
+    float acc[SK_R] = {};
+    uint4 pre[LPT];
+    auto load_chunk = [&](int ci0, uint4 * dst) {
+#pragma unroll
+        for (int l = 0; l < LPT; ++l) {
+            const int i = tid + l * SK_NT, row = i / (SK_CCH / 8), c8 = (i % (SK_CCH / 8)) * 8, co = co0 + row;
+            dst[l] = (co < a.Cout && ci0 + c8 < a.Cin)
+                ? *reinterpret_cast<const uint4 *>(W + static_cast<std::size_t>(co) * a.Cin + ci0 + c8) : make_uint4(0u, 0u, 0u, 0u);
+        }
+    };
+    load_chunk(0, pre);
+    for (int ci0 = 0; ci0 < a.Cin; ci0 += SK_CCH) {
+        const int cn = min(SK_CCH, a.Cin - ci0);
+        uint4 cur[LPT];
+#pragma unroll
+        for (int l = 0; l < LPT; ++l) cur[l] = pre[l];
+        if (ci0 + SK_CCH < a.Cin) load_chunk(ci0 + SK_CCH, pre);
+        __syncthreads();   // the previous chunk's readers are done
+#pragma unroll
+        for (int l = 0; l < LPT; ++l) {
+            const int i = tid + l * SK_NT, row = i / (SK_CCH / 8), c8 = (i % (SK_CCH / 8)) * 8;
+            const unsigned wd[4] = {cur[l].x, cur[l].y, cur[l].z, cur[l].w};
+            float f[8];
+#pragma unroll
+            for (int k = 0; k < 8; ++k) f[k] = dev::half_bits_to_float(static_cast<unsigned short>((k & 1) ? (wd[k / 2] >> 16) : (wd[k / 2] & 0xffffu)));
+            *reinterpret_cast<float4 *>(&ws[row][c8]) = make_float4(f[0], f[1], f[2], f[3]);
+            *reinterpret_cast<float4 *>(&ws[row][c8 + 4]) = make_float4(f[4], f[5], f[6], f[7]);
+        }
+        __syncthreads();
+        if (live) {
+#pragma unroll 2
+            for (int c = 0; c < cn; c += 8) {
+                const float4 x0 = *reinterpret_cast<const float4 *>(xrow + ci0 + c), x1 = *reinterpret_cast<const float4 *>(xrow + ci0 + c + 4);
+                const float x[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+#pragma unroll
+                for (int r = 0; r < SK_R; ++r) {
+                    const float4 w0 = *reinterpret_cast<const float4 *>(&ws[wave * SK_R + r][c]), w1 = *reinterpret_cast<const float4 *>(&ws[wave * SK_R + r][c + 4]);
+                    const float w[8] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
+#pragma unroll
+                    for (int k = 0; k < 8; ++k) acc[r] += w[k] * x[k];
+                }
+            }
+        }
+    }
+    if (!live) return;
+#pragma unroll
+    for (int r = 0; r < SK_R; ++r) {
+        const int co = co0 + wave * SK_R + r;
+        if (co >= a.Cout) continue;
+        float v = acc[r];
+        if (a.bias) v += a.bias[co];
+        if (EPI == EPI_SILU) v = v / (1.f + __expf(-v));
+        else if (EPI == EPI_RESIDUAL) v += a.residual[static_cast<std::size_t>(t) * a.Cout + co];
+        a.y[static_cast<std::size_t>(t) * a.y_stride + co] = v;
+    }
+}
+
+// silu(g) * u over [T][x_stride] (g at [c], u at [C + c]) -> y[T][C]: the
+// PRO_SILU_GATE prologue as its own pass, the same expression per element.
+static __global__ void k_silu_gate(const float * x, int C, int x_stride, float * y) {
+    const float * row = x + static_cast<std::size_t>(blockIdx.x) * x_stride;
+    float * out = y + static_cast<std::size_t>(blockIdx.x) * C;
+    for (int c = threadIdx.x; c < C; c += blockDim.x) {
+        const float g = row[c];
+        out[c] = g / (1.f + __expf(-g)) * row[C + c];
+    }
+}
+
+
 static __global__ void k_rmsnorm(const float * x, const float * w, int C, float eps, float * y) {
     __shared__ float red[32];
     const float * row = x + static_cast<std::size_t>(blockIdx.x) * C;
