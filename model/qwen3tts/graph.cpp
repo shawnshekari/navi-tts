@@ -72,10 +72,11 @@ SynthStats Graph::synth(const SynthRequest & req, const std::function<void(std::
     I.codes.clear();
     const int H = p.talker.hidden;
     const int batch = req.vocoder_batch > 0 ? std::min(req.vocoder_batch, I.vocoder->max_chunk_frames()) : I.vocoder->max_chunk_frames();
+    const int first = req.first_batch > 0 ? std::min(req.first_batch, batch) : batch;
     int pending = 0;   // frames decoded by the talker but not yet vocoded
     bool first_audio = true;
     auto flush = [&](bool final) {
-        if (pending == 0 || (!final && pending < batch)) return;
+        if (pending == 0 || (!final && pending < (first_audio ? first : batch))) return;
         const auto tv = clock::now();
         I.pcm.clear();
         const std::size_t off = I.codes.size() - static_cast<std::size_t>(pending) * 16;

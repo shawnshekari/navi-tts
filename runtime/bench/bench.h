@@ -21,6 +21,7 @@ struct BenchOptions {
     std::uint64_t seed = 2;
     int repeats = 1;
     int warmup = 1;                                          // untimed utterances first (DESIGN 2)
+    int vocoder_batch = 0;                                   // frames per vocoder call; 0 = the vocoder's max (a whole-body request)
 };
 
 struct BenchResult {

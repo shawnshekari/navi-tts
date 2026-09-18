@@ -29,7 +29,8 @@ struct SynthRequest {
     std::uint64_t seed = 0;
     int max_frames = 600;             // 48 s at 12.5 Hz (DESIGN 2)
     Sampling sampling;                // defaults: the model's generation_config.json
-    int vocoder_batch = 8;            // frames per vocoder call (stream_batch_size)
+    int vocoder_batch = 0;            // frames per vocoder call; 0 = the vocoder's max. PCM is identical for any batching.
+    int first_batch = 0;              // frames in the first call (time to first audio); 0 = vocoder_batch
 };
 
 struct SynthStats {

@@ -47,6 +47,7 @@ struct Args {
     std::string default_voice;
     std::string model_id;
     std::string name;           // voices add
+    int batch = -1;             // bench: vocoder batch (-1 = the harness default)
     std::string ref_text;
     std::vector<std::string> rest;   // positional: voices <action> [id]
     bool upload = false;
@@ -59,7 +60,7 @@ int usage(const char * argv0) {
     std::fprintf(stderr,
         "navi-tts %s (%s, ROCm %s, %s)\n"
         "usage: %s info  [--model FILE] [--upload] [-v]\n"
-        "       %s bench --model FILE [--out results.jsonl] [--repeats N] [--voice REF.wav] [--seed N]\n"
+        "       %s bench --model FILE [--out results.jsonl] [--repeats N] [--voice REF.wav] [--seed N] [--batch FRAMES]\n"
         "       %s synth --model FILE --text TEXT (--voice REF.wav | --speaker EMB.npy) --out out.wav [--seed N] [--language L] [--max-frames N] [--greedy]\n"
         "       %s serve --model FILE [--voices DIR] [--default-voice ID] [--model-id ID] [--host 127.0.0.1] [--port 8080] [--xtts-port 8020] [--xtts-fallback-male ID] [--xtts-fallback-female ID] [--max-frames 600] [--no-warmup] [-V]\n"
         "       %s voices [--voices DIR] list\n"
@@ -101,6 +102,7 @@ Args parse(int argc, char ** argv) {
         else if (s == "--default-voice") a.default_voice = next("--default-voice");
         else if (s == "--model-id") a.model_id = next("--model-id");
         else if (s == "--name") a.name = next("--name");
+        else if (s == "--batch") a.batch = std::stoi(next("--batch"));
         else if (s == "--ref-text") a.ref_text = next("--ref-text");
         else if (s == "-v" || s == "-V" || s == "--verbose") a.verbose = true;
         else if (!s.empty() && s[0] != '-') a.rest.push_back(s);
@@ -223,6 +225,7 @@ int cmd_bench(const Args & a) {
     if (!a.voice.empty()) opt.voice_wav = a.voice;
     if (!a.text.empty()) opt.text = a.text;
     if (a.seed) opt.seed = a.seed;
+    if (a.batch >= 0) opt.vocoder_batch = a.batch;
     for (int i = 0; i < a.repeats; ++i) {
         const navi::BenchResult r = navi::run_bench(dev, opt);
         const std::string line = r.to_json();
