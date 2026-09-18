@@ -30,8 +30,12 @@ constexpr int TT = 32, CT = 64, CC = 16, NTHREADS = 256, MAX_DIL = 9;
 enum Pro { PRO_NONE = 0, PRO_SNAKE = 1, PRO_SILU_GATE = 2 };
 enum Epi { EPI_NONE = 0, EPI_GELU = 1, EPI_RESIDUAL = 2, EPI_SCALE_RESIDUAL = 3, EPI_CLAMP = 4 };
 
+template <class WT> __device__ __forceinline__ float wload(WT v);
+template <> __device__ __forceinline__ float wload<unsigned short>(unsigned short v) { return dev::half_bits_to_float(v); }
+template <> __device__ __forceinline__ float wload<float>(float v) { return v; }
+
 struct ConvArgs {
-    const unsigned short * W;   // [phases][Cout][Cin][K]
+    const void * W;             // [phases][Cout][Cin][K], f16 or f32
     const float * bias;         // [Cout] or null
     const float * x;            // [T_in][x_stride]
     const float * hist;         // [H][Cin] or null
@@ -44,18 +48,18 @@ struct ConvArgs {
     const float * scale;        // [Cout]
 };
 
-template <int K, int PRO, int EPI>
+template <class WT, int K, int PRO, int EPI>
 __global__ void __launch_bounds__(NTHREADS) k_conv(ConvArgs a) {
     constexpr int WIN = TT + (K - 1) * MAX_DIL;
     __shared__ float xs[WIN][CC];
-    __shared__ unsigned short ws[CT][CC * K];
+    __shared__ WT ws[CT][CC * K];
 
     const int phase = blockIdx.z;
     const int t0 = blockIdx.x * TT, co0 = blockIdx.y * CT;
     const int tid = threadIdx.x;
     const int tl = (tid / 32) * 4, cl = (tid % 32) * 2;
     const int H = (K - 1) * a.dil, win = TT + H;
-    const unsigned short * Wp = a.W + static_cast<std::size_t>(phase) * a.Cout * a.Cin * K;
+    const WT * Wp = static_cast<const WT *>(a.W) + static_cast<std::size_t>(phase) * a.Cout * a.Cin * K;
     float acc[4][2] = {};
 
     for (int ci0 = 0; ci0 < a.Cin; ci0 += CC) {
@@ -85,15 +89,15 @@ __global__ void __launch_bounds__(NTHREADS) k_conv(ConvArgs a) {
             const int col = i / (CC * K), rem = i % (CC * K);
             const int co = co0 + col, ci = ci0 + rem / K;
             ws[col][rem] = (co < a.Cout && ci < a.Cin)
-                ? Wp[(static_cast<std::size_t>(co) * a.Cin + ci) * K + rem % K] : static_cast<unsigned short>(0);
+                ? Wp[(static_cast<std::size_t>(co) * a.Cin + ci) * K + rem % K] : static_cast<WT>(0);
         }
         __syncthreads();
 #pragma unroll
         for (int c = 0; c < CC; ++c) {
 #pragma unroll
             for (int j = 0; j < K; ++j) {
-                const float w0 = dev::half_bits_to_float(ws[cl][c * K + j]);
-                const float w1 = dev::half_bits_to_float(ws[cl + 1][c * K + j]);
+                const float w0 = wload<WT>(ws[cl][c * K + j]);
+                const float w1 = wload<WT>(ws[cl + 1][c * K + j]);
 #pragma unroll
                 for (int r = 0; r < 4; ++r) {
                     const float xv = xs[tl + r + j * a.dil][c];
@@ -129,7 +133,8 @@ __global__ void __launch_bounds__(NTHREADS) k_conv(ConvArgs a) {
 }
 
 // ConvNeXt front: depthwise causal conv (k=7) then LayerNorm over channels.
-__global__ void k_dwconv_ln(const unsigned short * W, const float * bias, const float * x, const float * hist,
+template <class WT>
+__global__ void k_dwconv_ln(const WT * W, const float * bias, const float * x, const float * hist,
                             int T, int C, const float * ln_w, const float * ln_b, float eps, float * y) {
     __shared__ float red[32];
     const int t = blockIdx.x;
@@ -145,7 +150,7 @@ __global__ void k_dwconv_ln(const unsigned short * W, const float * bias, const 
                 const int tt = t - 6 + j;
                 const float xv = tt >= 0 ? x[static_cast<std::size_t>(tt) * C + ch]
                                          : hist[static_cast<std::size_t>(6 + tt) * C + ch];
-                acc += dev::half_bits_to_float(W[ch * 7 + j]) * xv;
+                acc += wload<WT>(W[ch * 7 + j]) * xv;
             }
         }
         v[k] = acc;
@@ -238,19 +243,19 @@ __global__ void k_attention(const float * qkv, int n_head, int head_dim, int pos
 }
 
 // RVQ: e[t] = [ codebook_first[c0] | sum_q codebook_rest_q[c_q] ]  (f16 rows -> f32)
-__global__ void k_rvq(const int * codes, int n_q, const unsigned short * cb_first, const unsigned short * cb_rest,
+template <class WT>
+__global__ void k_rvq(const int * codes, int n_q, const WT * cb_first, const WT * cb_rest,
                       int dim, int codebook_size, float * e) {
     const int t = blockIdx.x;
     const int * c = codes + t * n_q;
     for (int i = threadIdx.x; i < 2 * dim; i += blockDim.x) {
         float v;
         if (i < dim) {
-            v = dev::half_bits_to_float(cb_first[static_cast<std::size_t>(c[0]) * dim + i]);
+            v = wload<WT>(cb_first[static_cast<std::size_t>(c[0]) * dim + i]);
         } else {
             v = 0.f;
             for (int q = 1; q < n_q; ++q) {
-                v += dev::half_bits_to_float(
-                    cb_rest[(static_cast<std::size_t>(q - 1) * codebook_size + c[q]) * dim + (i - dim)]);
+                v += wload<WT>(cb_rest[(static_cast<std::size_t>(q - 1) * codebook_size + c[q]) * dim + (i - dim)]);
             }
         }
         e[static_cast<std::size_t>(t) * 2 * dim + i] = v;
@@ -269,7 +274,7 @@ __global__ void k_hist_update(const float * hist, const float * x, int T, int H,
 // ---------------------------------------------------------------------------
 
 struct Conv {
-    const unsigned short * W = nullptr;
+    const void * W = nullptr;
     const float * bias = nullptr;
     int Cin = 0, Cout = 0, K = 1, dil = 1, phases = 1;
     int H = 0;
@@ -285,7 +290,7 @@ struct Layer {
 
 struct Unit { Conv c1, c2; };
 struct Block { Conv up; Unit u[3]; int rate, Cin, Cout; };
-struct ConvNeXt { const unsigned short * dw; const float * dw_bias, * ln_w, * ln_b, * gamma; float * hist, * hist2; Conv pw1, pw2; };
+struct ConvNeXt { const void * dw; const float * dw_bias, * ln_w, * ln_b, * gamma; float * hist, * hist2; Conv pw1, pw2; };
 
 } // namespace
 
@@ -306,7 +311,8 @@ struct Vocoder::Impl {
     }
 
     // weights / layers
-    const unsigned short * cb_first = nullptr, * cb_rest = nullptr;
+    bool f32 = false;   // codec weights are f32 (general.codec_dtype)
+    const void * cb_first = nullptr, * cb_rest = nullptr;
     Conv rvq_proj, pre_conv, in_proj, out_proj, dec0, final_conv;
     const float * final_norm = nullptr;
     std::vector<Layer> layers;
@@ -344,7 +350,10 @@ struct Vocoder::Impl {
         const dim3 grid((T_in + TT - 1) / TT, (c.Cout + CT - 1) / CT, c.phases);
         const dim3 block(NTHREADS);
 #define NAVI_CONV_CASE(KK, PP, EE) \
-        if (c.K == KK && pro == PP && epi == EE) { k_conv<KK, PP, EE><<<grid, block, 0, stream>>>(a); goto launched; }
+        if (c.K == KK && pro == PP && epi == EE) { \
+            if (f32) k_conv<float, KK, PP, EE><<<grid, block, 0, stream>>>(a); \
+            else k_conv<unsigned short, KK, PP, EE><<<grid, block, 0, stream>>>(a); \
+            goto launched; }
         NAVI_CONV_CASE(1, PRO_NONE, EPI_NONE)
         NAVI_CONV_CASE(1, PRO_NONE, EPI_GELU)
         NAVI_CONV_CASE(1, PRO_NONE, EPI_SCALE_RESIDUAL)
@@ -373,7 +382,8 @@ struct Vocoder::Impl {
     void decode_chunk(int T) {
         const auto & vp = p.vocoder;
         const int VH = vp.hidden, L = p.vq_latent, HD = vp.n_head * vp.head_dim;
-        k_rvq<<<T, 256, 0, stream>>>(d_codes, p.vq_n_q, cb_first, cb_rest, p.vq_codebook_dim / 2, p.vq_codebook_size, e);
+        if (f32) k_rvq<float><<<T, 256, 0, stream>>>(d_codes, p.vq_n_q, static_cast<const float *>(cb_first), static_cast<const float *>(cb_rest), p.vq_codebook_dim / 2, p.vq_codebook_size, e);
+        else k_rvq<unsigned short><<<T, 256, 0, stream>>>(d_codes, p.vq_n_q, static_cast<const unsigned short *>(cb_first), static_cast<const unsigned short *>(cb_rest), p.vq_codebook_dim / 2, p.vq_codebook_size, e);
         run_conv(rvq_proj, PRO_NONE, EPI_NONE, e, T, p.vq_codebook_dim, h, p.vq_codebook_dim);
         snap("rvq", h, T, p.vq_codebook_dim);
         run_conv(pre_conv, PRO_NONE, EPI_NONE, h, T, p.vq_codebook_dim, a, L);
@@ -416,7 +426,8 @@ struct Vocoder::Impl {
             R *= r;
             snap(("up" + std::to_string(j) + "_t").c_str(), dst, R, L);
             ConvNeXt & cx = cnx[j];
-            k_dwconv_ln<<<R, 256, 0, stream>>>(cx.dw, cx.dw_bias, dst, cx.hist, R, L, cx.ln_w, cx.ln_b, 1e-6f, tmp);
+            if (f32) k_dwconv_ln<float><<<R, 256, 0, stream>>>(static_cast<const float *>(cx.dw), cx.dw_bias, dst, cx.hist, R, L, cx.ln_w, cx.ln_b, 1e-6f, tmp);
+            else k_dwconv_ln<unsigned short><<<R, 256, 0, stream>>>(static_cast<const unsigned short *>(cx.dw), cx.dw_bias, dst, cx.hist, R, L, cx.ln_w, cx.ln_b, 1e-6f, tmp);
             NAVI_HIP(hipGetLastError());
             snap(("up" + std::to_string(j) + "_ln").c_str(), tmp, R, L);
             {
@@ -457,10 +468,13 @@ struct Vocoder::Impl {
 
 namespace {
 
-std::vector<unsigned short> f16_of(const NaviFile & f, const std::string & name, const std::vector<std::uint64_t> & dims) {
+// Raw copy of a weight tensor in the file's own element type (f16 bits or f32).
+template <class T>
+std::vector<T> tensor_of(const NaviFile & f, const std::string & name, const std::vector<std::uint64_t> & dims) {
     const TensorInfo & t = f.get(name);
-    if (t.dtype != DType::F16 || t.dims != dims) fail("vocoder: " + name + " has unexpected dtype/shape " + t.shape_str());
-    std::vector<unsigned short> v(t.numel());
+    const DType want = sizeof(T) == 2 ? DType::F16 : DType::F32;
+    if (t.dtype != want || t.dims != dims) fail("vocoder: " + name + " has unexpected dtype/shape " + t.shape_str());
+    std::vector<T> v(t.numel());
     std::memcpy(v.data(), f.data(t), t.nbytes);
     return v;
 }
@@ -476,9 +490,10 @@ std::vector<float> f32_of(const NaviFile & f, const std::string & name) {
 // ConvTranspose1d weight [Cin][Cout][k] -> [s][Cout][Cin][k/s]; within a phase,
 // tap kk-1 is the current input row, tap kk-2 the previous one:
 //   out[i*s + p] = sum_m W[ci][co][p + m*s] * x[i - m]
-std::vector<unsigned short> transposed_phases(const std::vector<unsigned short> & w, int Cin, int Cout, int k, int s) {
+template <class T>
+std::vector<T> transposed_phases(const std::vector<T> & w, int Cin, int Cout, int k, int s) {
     const int kk = k / s;
-    std::vector<unsigned short> out(static_cast<std::size_t>(s) * Cout * Cin * kk);
+    std::vector<T> out(static_cast<std::size_t>(s) * Cout * Cin * kk);
     for (int ph = 0; ph < s; ++ph)
         for (int co = 0; co < Cout; ++co)
             for (int ci = 0; ci < Cin; ++ci)
@@ -490,19 +505,20 @@ std::vector<unsigned short> transposed_phases(const std::vector<unsigned short> 
     return out;
 }
 
-std::vector<unsigned short> concat_rows(const std::vector<std::vector<unsigned short>> & parts) {
-    std::vector<unsigned short> out;
+template <class T>
+std::vector<T> concat_rows(const std::vector<std::vector<T>> & parts) {
+    std::vector<T> out;
     for (const auto & p : parts) out.insert(out.end(), p.begin(), p.end());
     return out;
 }
 
 // [Cout][Cin_a] ++ [Cout][Cin_b] along Cin
-std::vector<unsigned short> concat_cols(const std::vector<unsigned short> & a, int ca,
-                                        const std::vector<unsigned short> & b, int cb, int Cout) {
-    std::vector<unsigned short> out(static_cast<std::size_t>(Cout) * (ca + cb));
+template <class T>
+std::vector<T> concat_cols(const std::vector<T> & a, int ca, const std::vector<T> & b, int cb, int Cout) {
+    std::vector<T> out(static_cast<std::size_t>(Cout) * (ca + cb));
     for (int co = 0; co < Cout; ++co) {
-        std::memcpy(&out[static_cast<std::size_t>(co) * (ca + cb)], &a[static_cast<std::size_t>(co) * ca], ca * 2);
-        std::memcpy(&out[static_cast<std::size_t>(co) * (ca + cb) + ca], &b[static_cast<std::size_t>(co) * cb], cb * 2);
+        std::memcpy(&out[static_cast<std::size_t>(co) * (ca + cb)], &a[static_cast<std::size_t>(co) * ca], ca * sizeof(T));
+        std::memcpy(&out[static_cast<std::size_t>(co) * (ca + cb) + ca], &b[static_cast<std::size_t>(co) * cb], cb * sizeof(T));
     }
     return out;
 }
@@ -545,7 +561,8 @@ std::unique_ptr<Vocoder> Vocoder::create(const Device & dev, const NaviFile & f,
     if (vp.n_head != vp.n_kv_head) fail("vocoder: GQA not supported in the pre-transformer");
 
     auto dw = [&](const std::string & name) { return w.get(name); };
-    auto f16p = [&](const std::string & name) { return dw(name).as<unsigned short>(); };
+    auto wp = [&](const std::string & name) { return dw(name).ptr; };
+    I.f32 = f.get(DEC + "pre_conv.conv.weight").dtype == DType::F32;
     auto f32p = [&](const std::string & name) { return dw(name).as<float>(); };
     auto snake = [&](const std::string & prefix, Conv & c) {
         const auto alpha = f32_of(f, prefix + ".alpha"), beta = f32_of(f, prefix + ".beta");
@@ -565,25 +582,13 @@ std::unique_ptr<Vocoder> Vocoder::create(const Device & dev, const NaviFile & f,
         }
     };
 
-    // RVQ
-    I.cb_first = f16p(DEC + "quantizer.rvq_first.vq.layers.0._codebook.codebook");
-    {
-        // the 15 rest codebooks are separate tensors; pack them contiguously [15][2048][256]
-        std::vector<std::vector<unsigned short>> books;
-        for (int q = 0; q < p.vq_n_q - p.vq_n_semantic; ++q) {
-            books.push_back(f16_of(f, DEC + "quantizer.rvq_rest.vq.layers." + std::to_string(q) + "._codebook.codebook",
-                                   {static_cast<std::uint64_t>(p.vq_codebook_size), static_cast<std::uint64_t>(VQ)}));
-        }
-        I.cb_rest = I.upload(concat_rows(books));
-        const auto wf = f16_of(f, DEC + "quantizer.rvq_first.output_proj.weight", {static_cast<std::uint64_t>(CD), static_cast<std::uint64_t>(VQ), 1});
-        const auto wr = f16_of(f, DEC + "quantizer.rvq_rest.output_proj.weight", {static_cast<std::uint64_t>(CD), static_cast<std::uint64_t>(VQ), 1});
-        I.rvq_proj.W = I.upload(concat_cols(wf, VQ, wr, VQ, CD));
-        I.rvq_proj.Cin = CD; I.rvq_proj.Cout = CD; I.rvq_proj.K = 1;
-    }
-    I.pre_conv = Conv{f16p(DEC + "pre_conv.conv.weight"), f32p(DEC + "pre_conv.conv.bias"), CD, L, 3, 1, 1};
+    // RVQ (codebooks and projections are prepared per weight type below)
+    I.cb_first = wp(DEC + "quantizer.rvq_first.vq.layers.0._codebook.codebook");
+    I.rvq_proj.Cin = CD; I.rvq_proj.Cout = CD; I.rvq_proj.K = 1;
+    I.pre_conv = Conv{wp(DEC + "pre_conv.conv.weight"), f32p(DEC + "pre_conv.conv.bias"), CD, L, 3, 1, 1};
     with_hist(I.pre_conv);
-    I.in_proj = Conv{f16p(DEC + "pre_transformer.input_proj.weight"), f32p(DEC + "pre_transformer.input_proj.bias"), L, VH, 1, 1, 1};
-    I.out_proj = Conv{f16p(DEC + "pre_transformer.output_proj.weight"), f32p(DEC + "pre_transformer.output_proj.bias"), VH, L, 1, 1, 1};
+    I.in_proj = Conv{wp(DEC + "pre_transformer.input_proj.weight"), f32p(DEC + "pre_transformer.input_proj.bias"), L, VH, 1, 1, 1};
+    I.out_proj = Conv{wp(DEC + "pre_transformer.output_proj.weight"), f32p(DEC + "pre_transformer.output_proj.bias"), VH, L, 1, 1, 1};
     I.final_norm = f32p(DEC + "pre_transformer.norm.weight");
 
     I.ring = 8;
@@ -596,17 +601,10 @@ std::unique_ptr<Vocoder> Vocoder::create(const Device & dev, const NaviFile & f,
         ly.ln2 = f32p(lp + "post_attention_layernorm.weight");
         ly.attn_scale = f32p(lp + "self_attn_layer_scale.scale");
         ly.mlp_scale = f32p(lp + "mlp_layer_scale.scale");
-        const std::vector<std::uint64_t> qkv_dims{static_cast<std::uint64_t>(HD), static_cast<std::uint64_t>(VH)};
-        ly.qkv.W = I.upload(concat_rows({f16_of(f, lp + "self_attn.q_proj.weight", qkv_dims),
-                                         f16_of(f, lp + "self_attn.k_proj.weight", qkv_dims),
-                                         f16_of(f, lp + "self_attn.v_proj.weight", qkv_dims)}));
         ly.qkv.Cin = VH; ly.qkv.Cout = 3 * HD; ly.qkv.K = 1;
-        ly.o = Conv{f16p(lp + "self_attn.o_proj.weight"), nullptr, HD, VH, 1, 1, 1};
-        const std::vector<std::uint64_t> ff_dims{static_cast<std::uint64_t>(vp.ff), static_cast<std::uint64_t>(VH)};
-        ly.gateup.W = I.upload(concat_rows({f16_of(f, lp + "mlp.gate_proj.weight", ff_dims),
-                                            f16_of(f, lp + "mlp.up_proj.weight", ff_dims)}));
+        ly.o = Conv{wp(lp + "self_attn.o_proj.weight"), nullptr, HD, VH, 1, 1, 1};
         ly.gateup.Cin = VH; ly.gateup.Cout = 2 * vp.ff; ly.gateup.K = 1;
-        ly.down = Conv{f16p(lp + "mlp.down_proj.weight"), nullptr, vp.ff, VH, 1, 1, 1};
+        ly.down = Conv{wp(lp + "mlp.down_proj.weight"), nullptr, vp.ff, VH, 1, 1, 1};
         ly.kc = I.alloc<float>(static_cast<std::size_t>(I.ring) * HD);
         ly.vc = I.alloc<float>(static_cast<std::size_t>(I.ring) * HD);
         I.layers.push_back(ly);
@@ -615,24 +613,22 @@ std::unique_ptr<Vocoder> Vocoder::create(const Device & dev, const NaviFile & f,
     for (int j = 0; j < 2; ++j) {
         const int r = p.vocoder_upsampling_ratios[static_cast<std::size_t>(j)];
         const std::string up = DEC + "upsample." + std::to_string(j) + ".";
-        const auto wt = f16_of(f, up + "0.conv.weight", {static_cast<std::uint64_t>(L), static_cast<std::uint64_t>(L), static_cast<std::uint64_t>(r)});
         Conv & c = I.up_conv[j];
-        c.W = I.upload(transposed_phases(wt, L, L, r, r));
         c.bias = f32p(up + "0.conv.bias");
         c.Cin = L; c.Cout = L; c.K = 1; c.phases = r;
         ConvNeXt & cx = I.cnx[j];
-        cx.dw = f16p(up + "1.dwconv.conv.weight");
+        cx.dw = wp(up + "1.dwconv.conv.weight");
         cx.dw_bias = f32p(up + "1.dwconv.conv.bias");
         cx.ln_w = f32p(up + "1.norm.weight");
         cx.ln_b = f32p(up + "1.norm.bias");
         cx.gamma = f32p(up + "1.gamma");
         cx.hist = I.alloc<float>(static_cast<std::size_t>(6) * L);
         cx.hist2 = I.alloc<float>(static_cast<std::size_t>(6) * L);
-        cx.pw1 = Conv{f16p(up + "1.pwconv1.weight"), f32p(up + "1.pwconv1.bias"), L, 4 * L, 1, 1, 1};
-        cx.pw2 = Conv{f16p(up + "1.pwconv2.weight"), f32p(up + "1.pwconv2.bias"), 4 * L, L, 1, 1, 1};
+        cx.pw1 = Conv{wp(up + "1.pwconv1.weight"), f32p(up + "1.pwconv1.bias"), L, 4 * L, 1, 1, 1};
+        cx.pw2 = Conv{wp(up + "1.pwconv2.weight"), f32p(up + "1.pwconv2.bias"), 4 * L, L, 1, 1, 1};
     }
 
-    I.dec0 = Conv{f16p(DEC + "decoder.0.conv.weight"), f32p(DEC + "decoder.0.conv.bias"), L, DD, 7, 1, 1};
+    I.dec0 = Conv{wp(DEC + "decoder.0.conv.weight"), f32p(DEC + "decoder.0.conv.bias"), L, DD, 7, 1, 1};
     with_hist(I.dec0);
     int width = DD;
     int rows = 4;   // rows per frame after the two x2 upsamples
@@ -641,8 +637,6 @@ std::unique_ptr<Vocoder> Vocoder::create(const Device & dev, const NaviFile & f,
         bk.rate = p.vocoder_upsample_rates[static_cast<std::size_t>(b)];
         bk.Cin = width; bk.Cout = width / 2;
         const std::string bp = DEC + "decoder." + std::to_string(b + 1) + ".block.";
-        const auto wt = f16_of(f, bp + "1.conv.weight", {static_cast<std::uint64_t>(bk.Cin), static_cast<std::uint64_t>(bk.Cout), static_cast<std::uint64_t>(2 * bk.rate)});
-        bk.up.W = I.upload(transposed_phases(wt, bk.Cin, bk.Cout, 2 * bk.rate, bk.rate));
         bk.up.bias = f32p(bp + "1.conv.bias");
         bk.up.Cin = bk.Cin; bk.up.Cout = bk.Cout; bk.up.K = 2; bk.up.phases = bk.rate;
         with_hist(bk.up);
@@ -651,10 +645,10 @@ std::unique_ptr<Vocoder> Vocoder::create(const Device & dev, const NaviFile & f,
         for (int k = 0; k < 3; ++k) {
             const std::string rp = bp + std::to_string(2 + k) + ".";
             Unit & un = bk.u[k];
-            un.c1 = Conv{f16p(rp + "conv1.conv.weight"), f32p(rp + "conv1.conv.bias"), bk.Cout, bk.Cout, 7, dils[k], 1};
+            un.c1 = Conv{wp(rp + "conv1.conv.weight"), f32p(rp + "conv1.conv.bias"), bk.Cout, bk.Cout, 7, dils[k], 1};
             with_hist(un.c1);
             snake(rp + "act1", un.c1);
-            un.c2 = Conv{f16p(rp + "conv2.conv.weight"), f32p(rp + "conv2.conv.bias"), bk.Cout, bk.Cout, 1, 1, 1};
+            un.c2 = Conv{wp(rp + "conv2.conv.weight"), f32p(rp + "conv2.conv.bias"), bk.Cout, bk.Cout, 1, 1, 1};
             snake(rp + "act2", un.c2);
         }
         rows *= bk.rate;
@@ -664,9 +658,47 @@ std::unique_ptr<Vocoder> Vocoder::create(const Device & dev, const NaviFile & f,
         width = bk.Cout;
     }
     if (rows != p.codec_upsample) fail("vocoder: upsample chain gives " + std::to_string(rows) + " samples/frame, config says " + std::to_string(p.codec_upsample));
-    I.final_conv = Conv{f16p(DEC + "decoder.6.conv.weight"), f32p(DEC + "decoder.6.conv.bias"), width, 1, 7, 1, 1};
+    I.final_conv = Conv{wp(DEC + "decoder.6.conv.weight"), f32p(DEC + "decoder.6.conv.bias"), width, 1, 7, 1, 1};
     with_hist(I.final_conv);
     snake(DEC + "decoder.5", I.final_conv);
+
+    // Weight-type-dependent preparation: packed codebooks, concatenated
+    // projections, phase-major transposed convs. Same code for f16 and f32.
+    auto u64 = [](int v) { return static_cast<std::uint64_t>(v); };
+    auto prep = [&]<class T>() {
+        std::vector<std::vector<T>> books;
+        for (int q = 0; q < p.vq_n_q - p.vq_n_semantic; ++q) {
+            books.push_back(tensor_of<T>(f, DEC + "quantizer.rvq_rest.vq.layers." + std::to_string(q) + "._codebook.codebook",
+                                         {u64(p.vq_codebook_size), u64(VQ)}));
+        }
+        I.cb_rest = I.upload(concat_rows<T>(books));
+        const auto wf = tensor_of<T>(f, DEC + "quantizer.rvq_first.output_proj.weight", {u64(CD), u64(VQ), 1});
+        const auto wr = tensor_of<T>(f, DEC + "quantizer.rvq_rest.output_proj.weight", {u64(CD), u64(VQ), 1});
+        I.rvq_proj.W = I.upload(concat_cols<T>(wf, VQ, wr, VQ, CD));
+        for (int l = 0; l < vp.n_layer; ++l) {
+            const std::string lp = DEC + "pre_transformer.layers." + std::to_string(l) + ".";
+            const std::vector<std::uint64_t> qkv_dims{u64(HD), u64(VH)}, ff_dims{u64(vp.ff), u64(VH)};
+            I.layers[static_cast<std::size_t>(l)].qkv.W = I.upload(concat_rows<T>({
+                tensor_of<T>(f, lp + "self_attn.q_proj.weight", qkv_dims),
+                tensor_of<T>(f, lp + "self_attn.k_proj.weight", qkv_dims),
+                tensor_of<T>(f, lp + "self_attn.v_proj.weight", qkv_dims)}));
+            I.layers[static_cast<std::size_t>(l)].gateup.W = I.upload(concat_rows<T>({
+                tensor_of<T>(f, lp + "mlp.gate_proj.weight", ff_dims),
+                tensor_of<T>(f, lp + "mlp.up_proj.weight", ff_dims)}));
+        }
+        for (int j = 0; j < 2; ++j) {
+            const int r = p.vocoder_upsampling_ratios[static_cast<std::size_t>(j)];
+            const auto wt = tensor_of<T>(f, DEC + "upsample." + std::to_string(j) + ".0.conv.weight", {u64(L), u64(L), u64(r)});
+            I.up_conv[j].W = I.upload(transposed_phases<T>(wt, L, L, r, r));
+        }
+        for (int b = 0; b < 4; ++b) {
+            Block & bk = I.blocks[b];
+            const auto wt = tensor_of<T>(f, DEC + "decoder." + std::to_string(b + 1) + ".block.1.conv.weight",
+                                         {u64(bk.Cin), u64(bk.Cout), u64(2 * bk.rate)});
+            bk.up.W = I.upload(transposed_phases<T>(wt, bk.Cin, bk.Cout, 2 * bk.rate, bk.rate));
+        }
+    };
+    if (I.f32) prep.template operator()<float>(); else prep.template operator()<unsigned short>();
 
     const std::size_t C = static_cast<std::size_t>(max_chunk_frames);
     I.d_codes = I.alloc<int>(C * p.vq_n_q);

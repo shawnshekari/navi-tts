@@ -43,13 +43,17 @@ int main(int argc, char ** argv) {
         const auto pcm_npy = navi::Npy::load(ref + "/sampled_pcm.npy");
         const auto codes = codes_npy.as_i32();
         const auto want = pcm_npy.as_f32();
-        const auto want16 = navi::Npy::load(ref + "/sampled_pcm_f16w.npy").as_f32();
+        std::vector<float> want16;   // filled once the blob's codec dtype is known
         const int n_frames = static_cast<int>(codes_npy.shape[0]);
         std::printf("reference: %d frames, %zu samples\n", n_frames, want.size());
 
         navi::Device dev = navi::Device::open();
         navi::NaviFile file = navi::NaviFile::open(argv[1]);
         const auto params = navi::qwen3tts::read_params(file);
+        // kernel exactness is judged against torch run at the blob's own weight precision
+        const bool codec_f32 = file.has_kv("general.codec_dtype") && file.kv_str("general.codec_dtype") == "f32";
+        want16 = codec_f32 ? want : navi::Npy::load(ref + "/sampled_pcm_f16w.npy").as_f32();
+        std::printf("codec weights: %s\n", codec_f32 ? "f32" : "f16");
         const std::string dec = "codec.decoder.";
         auto select = [&](const navi::TensorInfo & t) {
             return t.name.compare(0, dec.size(), dec) == 0 && !navi::qwen3tts::vocoder_owns_tensor(t.name);
@@ -85,9 +89,9 @@ int main(int argc, char ** argv) {
             return 1;
         }
         const Cmp a = compare(one, want), k = compare(one, want16), b = compare(chunked, want), c = compare(chunked, one);
-        std::printf("one-shot vs torch f16w: max|d| %.3e at %zu, rms %.3e, SNR %.1f dB   <- kernel exactness\n",
-                    k.max_abs, k.argmax, k.rms_err, k.snr_db);
-        std::printf("one-shot vs torch f32 : max|d| %.3e at %zu, rms %.3e, SNR %.1f dB   <- f16 weight budget  (%.2f ms, %.3f ms/frame)\n",
+        std::printf("one-shot vs torch %s: max|d| %.3e at %zu, rms %.3e, SNR %.1f dB   <- kernel exactness\n",
+                    codec_f32 ? "f32 " : "f16w", k.max_abs, k.argmax, k.rms_err, k.snr_db);
+        std::printf("one-shot vs torch f32 : max|d| %.3e at %zu, rms %.3e, SNR %.1f dB   <- weight budget  (%.2f ms, %.3f ms/frame)\n",
                     a.max_abs, a.argmax, a.rms_err, a.snr_db, ms_one, ms_one / n_frames);
         std::printf("chunked8 vs torch f32 : max|d| %.3e, rms %.3e, SNR %.1f dB   (%.2f ms, %.3f ms/frame)\n",
                     b.max_abs, b.rms_err, b.snr_db, ms_chunk, ms_chunk / n_frames);

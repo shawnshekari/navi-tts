@@ -163,7 +163,7 @@ TRANSFORMER_KEYS = [
 ]
 
 
-def write_metadata(w: NaviWriter, root: Path, with_encoder: bool, target: str):
+def write_metadata(w: NaviWriter, root: Path, with_encoder: bool, target: str, codec_target: str | None = None):
     cfg = json.loads((root / "config.json").read_text())
     tk = cfg["talker_config"]
     cp = tk["code_predictor_config"]
@@ -178,6 +178,7 @@ def write_metadata(w: NaviWriter, root: Path, with_encoder: bool, target: str):
     w.add_kv("general.tts_model_size", cfg["tts_model_size"])
     w.add_kv("general.tokenizer_type", cfg["tokenizer_type"])
     w.add_kv("general.dtype", target)
+    w.add_kv("general.codec_dtype", codec_target or target)
     w.add_kv("general.converter", "navi-tts tools/convert.py format-v1")
     w.add_kv("general.has_codec_encoder", with_encoder)
 
@@ -267,10 +268,11 @@ def store(w: NaviWriter, st: Stats, name: str, arr: np.ndarray, target_dtype: in
     st.bytes += arr.size * np.dtype(NP_DTYPE[dtype]).itemsize
 
 
-def convert(root: Path, out: Path, target: str, with_encoder: bool, verbose: bool) -> None:
+def convert(root: Path, out: Path, target: str, with_encoder: bool, verbose: bool, codec_target: str | None = None) -> None:
     target_dtype = TARGET_DTYPES[target]
+    codec_dtype = TARGET_DTYPES[codec_target or target]
     w = NaviWriter()
-    write_metadata(w, root, with_encoder, target)
+    write_metadata(w, root, with_encoder, target, codec_target)
     for fname, tname in (("vocab.json", "tokenizer.vocab.json"), ("merges.txt", "tokenizer.merges.txt"),
                          ("tokenizer_config.json", "tokenizer.config.json")):
         add_file_bytes(w, tname, root / fname)
@@ -297,13 +299,13 @@ def convert(root: Path, out: Path, target: str, with_encoder: bool, verbose: boo
             base = name.rsplit(".", 1)[0]
             pending_codebooks.setdefault(base, {})[leaf] = codec.get(name)
             continue
-        store(w, st, "codec." + name, codec.get(name), target_dtype)
+        store(w, st, "codec." + name, codec.get(name), codec_dtype)
     for base, parts in pending_codebooks.items():
         emb = parts.get("embedding_sum", parts.get("embed_sum"))
         usage = parts["cluster_usage"]
         # EuclideanCodebook.decode: embedding_sum / cluster_usage.clamp(min=1e-5)
         book = emb / np.maximum(usage, 1e-5)[:, None]
-        store(w, st, "codec." + base + ".codebook", book.astype(np.float32), target_dtype)
+        store(w, st, "codec." + base + ".codebook", book.astype(np.float32), codec_dtype)
 
     size = w.write(out)
     print(f"wrote {out} ({size / 1e9:.3f} GB): {len(w.kv)} kv, {len(w.tensors)} tensors, "
@@ -318,10 +320,12 @@ def main():
     ap.add_argument("model_dir", type=Path, help="HF model directory (config.json, model.safetensors, speech_tokenizer/)")
     ap.add_argument("out", type=Path, help="output .navi path")
     ap.add_argument("--dtype", choices=sorted(TARGET_DTYPES), default="f16", help="dtype for >=2-D tensors (default f16)")
+    ap.add_argument("--codec-dtype", choices=sorted(TARGET_DTYPES), default=None,
+                    help="dtype for the codec's >=2-D tensors (default: same as --dtype)")
     ap.add_argument("--with-encoder", action="store_true", help="include the codec encoder (ICL cloning)")
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args()
-    convert(a.model_dir, a.out, a.dtype, a.with_encoder, a.verbose)
+    convert(a.model_dir, a.out, a.dtype, a.with_encoder, a.verbose, a.codec_dtype)
 
 
 if __name__ == "__main__":
