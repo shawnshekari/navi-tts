@@ -75,7 +75,7 @@ int main(int argc, char ** argv) {
         navi::DeviceWeights w = navi::DeviceWeights::upload(file, [](const navi::TensorInfo & t) {
             return t.name.rfind("talker.model.", 0) == 0 || t.name.rfind("talker.text_projection.", 0) == 0 ||
                    t.name == "talker.codec_head.weight";
-        });
+        }, navi::qwen3tts::Talker::fused_groups(params));
         file.close();
         auto talker = navi::qwen3tts::Talker::create(dev, w, params);
 

@@ -1,6 +1,10 @@
 {
   "version": 6,
-  "cmakeMinimumRequired": { "major": 3, "minor": 28, "patch": 0 },
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 28,
+    "patch": 0
+  },
   "configurePresets": [
     {
       "name": "base",
@@ -17,21 +21,55 @@
       "name": "xtx",
       "displayName": "RX 7900 XTX (gfx1100), Release",
       "inherits": "base",
-      "cacheVariables": { "NAVI_GPU_ARCHS": "gfx1100" }
+      "cacheVariables": {
+        "NAVI_GPU_ARCHS": "gfx1100"
+      }
     },
     {
       "name": "xtx-debug",
       "displayName": "RX 7900 XTX (gfx1100), RelWithDebInfo",
       "inherits": "xtx",
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo" }
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      }
+    },
+    {
+      "name": "strix",
+      "inherits": "base",
+      "displayName": "Strix Halo (gfx1151), Release",
+      "cacheVariables": {
+        "NAVI_GPU_ARCHS": "gfx1151"
+      }
     }
   ],
   "buildPresets": [
-    { "name": "xtx", "configurePreset": "xtx" },
-    { "name": "xtx-debug", "configurePreset": "xtx-debug" }
+    {
+      "name": "xtx",
+      "configurePreset": "xtx"
+    },
+    {
+      "name": "xtx-debug",
+      "configurePreset": "xtx-debug"
+    },
+    {
+      "name": "strix",
+      "configurePreset": "strix"
+    }
   ],
   "testPresets": [
-    { "name": "xtx", "configurePreset": "xtx", "output": { "outputOnFailure": true } },
-    { "name": "xtx-debug", "configurePreset": "xtx-debug", "output": { "outputOnFailure": true } }
+    {
+      "name": "xtx",
+      "configurePreset": "xtx",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "xtx-debug",
+      "configurePreset": "xtx-debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
   ]
 }

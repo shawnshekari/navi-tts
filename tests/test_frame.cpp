@@ -32,7 +32,7 @@ int main(int argc, char ** argv) {
         const auto params = navi::qwen3tts::read_params(file);
         navi::DeviceWeights w = navi::DeviceWeights::upload(file, [](const navi::TensorInfo & t) {
             return t.name.rfind("talker.", 0) == 0;
-        });
+        }, navi::qwen3tts::Talker::fused_groups(params));
         file.close();
         auto talker = navi::qwen3tts::Talker::create(dev, w, params);
         auto frame = navi::qwen3tts::Frame::create(dev, w, params);

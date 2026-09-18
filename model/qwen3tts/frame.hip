@@ -304,11 +304,16 @@ __device__ void tl_qkv(const TlParams & P, const TlWeights & W, const Work & B, 
     grid_matvec<false>(W.wv[il], P.n_kv_head * P.head_dim, P.hidden, xs, B.v);
 }
 
-// blocks [0, n_head): q heads; [n_head, +n_kv_head): k heads (+cache); [.., +n_kv_head): v -> cache
+// head slots [0, n_head): q heads; [n_head, +n_kv_head): k heads (+cache); [.., +n_kv_head):
+// v -> cache. A block takes slots blockIdx.x, +gridDim.x, ...: one each on the XTX's
+// 48 blocks, two on Strix Halo's 20 (32 slots; with one slot per block the last 12
+// were never done - found at M3). Each slot's arithmetic is the same either way.
 template <class WP>
 __device__ void norm_rope_store(const WP & P, const float * q_norm, const float * k_norm, float * q, float * k,
                                 const float * v, int pos, uint16_t * kcache, uint16_t * vcache, float * xs, float * red) {
-    const int hd = P.head_dim, b = blockIdx.x, t = threadIdx.x, kv_stride = P.n_kv_head * hd;
+    const int hd = P.head_dim, t = threadIdx.x, kv_stride = P.n_kv_head * hd;
+    for (int b = blockIdx.x; b < P.n_head + 2 * P.n_kv_head; b += gridDim.x) {
+    __syncthreads();   // xs / red free from the previous slot
     if (b < P.n_head + P.n_kv_head) {
         const bool is_q = b < P.n_head;
         const int head = is_q ? b : b - P.n_head;
@@ -333,9 +338,10 @@ __device__ void norm_rope_store(const WP & P, const float * q_norm, const float 
                 f2h(kc, t + hd / 2, r1);
             }
         }
-    } else if (b < P.n_head + 2 * P.n_kv_head) {
+    } else {
         const int head = b - P.n_head - P.n_kv_head;
         if (t < hd) f2h(vcache + static_cast<size_t>(pos) * kv_stride + head * hd, t, v[head * hd + t]);
+    }
     }
 }
 
@@ -343,8 +349,8 @@ __device__ void norm_rope_store(const WP & P, const float * q_norm, const float 
 template <class WP>
 __device__ void attend(const WP & P, const float * q, const uint16_t * kcache, const uint16_t * vcache, int pos,
                        float * out, float * xs) {
-    const int h = blockIdx.x;
-    if (h >= P.n_head) return;
+    for (int h = blockIdx.x; h < P.n_head; h += gridDim.x) {   // one head per block when the grid allows
+    __syncthreads();
     const int hd = P.head_dim, kvh = h / (P.n_head / P.n_kv_head), kv_stride = P.n_kv_head * hd;
     const int lane = threadIdx.x % warpSize, wid = threadIdx.x / warpSize, nw = blockDim.x / warpSize;
     const float scale = rsqrtf(static_cast<float>(hd));
@@ -374,6 +380,7 @@ __device__ void attend(const WP & P, const float * q, const uint16_t * kcache, c
         float acc = 0.f;
         for (int j = 0; j <= pos; ++j) acc += scores[j] * h2f(vcache + static_cast<size_t>(j) * kv_stride + kvh * hd, i);
         out[h * hd + i] = acc;
+    }
     }
 }
 
