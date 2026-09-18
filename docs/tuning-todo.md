@@ -110,6 +110,16 @@ The cap is a constant today (`frame.hip:70`, `B.spin_cap = opt.spin_cap`).
   (§9, OPEN). Listen test first.
 - **1.7B.** Stretch test at M3, not a target.
 
+## Strix Halo (M3) — first numbers 2026-09-18, `403af27`
+
+Frame 20.1 ms, prefill 16.5, vocoder 1.27 ms/frame, TTFA 98 ms, RTF 0.271,
+sha `4cb7232a…` (= the XTX). Everything is 2.5-3.3× the XTX, the bandwidth
+ratio, so the levers are the same ones in the same order — and int8 (M4)
+is worth proportionally more here. Not yet done: fat binary, a service
+unit, the grid/spin parameters from data (the frame kernel runs 20 blocks
+at occupancy 3; the spin cap is the XTX's), `libstdc++-devel` on the host
+(`docs/reference/toolchain.md`).
+
 ## Decisions this list is waiting on
 
 - **Text-derived frame cap.** ~15 % of seeds on one- or two-token prompts run

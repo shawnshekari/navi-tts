@@ -242,14 +242,16 @@ engine change.
 
 | | gfx1100 | gfx1151 |
 |---|---|---|
-| Frame (talker + cp) | ≤ 8.5 ms at M1 (parity with the fork); goal ~7.5 — **6.24 ms at M2** | measure at M3, then set |
-| Vocoder | ~1.2 ms/frame — 1.28 streaming, 1.03 whole-body | measure |
-| TTFA, streaming | < 300 ms — **58 ms** | < 500 ms |
-| RTF, queue median under llama-server contention | ≤ 0.12 — **0.099 quiet, 0.30 under a 745 GB/s hog** | ≤ 0.5 is the usefulness bar |
+| Frame (talker + cp) | ≤ 8.5 ms at M1 (parity with the fork); goal ~7.5 — **6.13 ms** | **20.1 ms** measured at M3's first build (3.3× the XTX, the bandwidth ratio); target to set from tuning |
+| Vocoder | ~1.2 ms/frame — **0.62** streaming | **1.27** |
+| TTFA, streaming | < 300 ms — **34 ms** | < 500 ms — **98 ms** |
+| RTF, queue median under llama-server contention | ≤ 0.12 — **0.086 quiet, 0.30 under a 745 GB/s hog** | ≤ 0.5 is the usefulness bar — **0.271 quiet** |
 | First request after start | no slower than steady state (warm-up) — met | same |
 
-Measured at M2 (2026-09-17, `bench/results.jsonl`, WAV sha unchanged through
-every step). `docs/tuning.md` records what moved the numbers and what did not.
+XTX measured through the 2026-09-18 tuning pass, Strix Halo at its first
+build the same day (`bench/results.jsonl`; the bench WAV's sha is the same
+on both targets, `4cb7232a…` - the kernels are bit-exact across the two).
+`docs/tuning.md` records what moved the numbers and what did not.
 
 Numbers go on the README front page from the bench harness, per release.
 
@@ -340,7 +342,11 @@ M0-M2 are the XTX. Nothing runs on the mini PC before M3.
   **Cut over 2026-09-17** (`docs/cutover.md`); the day's soak is the open item.
   A first tuning pass followed the same evening (`docs/tuning.md`).
 - **M3 — Strix Halo.** Fat binary, build and bench on the mini PC, tune grid/
-  spin from data, front-page numbers for both targets.
+  spin from data, front-page numbers for both targets. **Started 2026-09-18:**
+  `strix` preset builds and all five gates pass on gfx1151 after one fix (the
+  frame's head slots assumed ≥ 32 blocks; Strix has 20); bench sha identical
+  to the XTX; front-page row filled. Not yet: a fat binary (two builds for
+  now), a service unit on the mini PC, grid/spin tuning from data.
 - **M4 — levers.** Frame-kernel fusion of the host tail, spin cap from p99, ICL
   cloning, quantised GEMV (worth re-measuring on gfx1151 even though the XTX
   ruled it out), 1.7B, fine-tuned weights through the converter.
