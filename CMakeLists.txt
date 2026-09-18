@@ -96,7 +96,6 @@ add_library(navi_runtime STATIC
     runtime/weights/navi_file.cpp
     runtime/weights/device_weights.cpp
     runtime/audio/wav.cpp
-    runtime/bench/bench.cpp
     runtime/voices/store.cpp
 )
 target_include_directories(navi_runtime PUBLIC "${CMAKE_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/generated")
@@ -117,7 +116,8 @@ target_compile_definitions(navi_server PRIVATE CPPHTTPLIB_THREAD_POOL_COUNT=4)
 find_package(Threads REQUIRED)
 target_link_libraries(navi_server PUBLIC Threads::Threads)
 
-add_executable(navi-tts runtime/cli/main.cpp)
+# The bench drives the model graph, so it lives with the binary, not the runtime library.
+add_executable(navi-tts runtime/cli/main.cpp runtime/bench/bench.cpp)
 target_link_libraries(navi-tts PRIVATE navi_server navi_qwen3tts navi_runtime)
 
 # --- tests -------------------------------------------------------------------

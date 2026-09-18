@@ -2,8 +2,9 @@
 
 // The controlled A/B harness (DESIGN 7): same code path as serving, no HTTP,
 // fixed text/voice/seed, one JSON line to append to bench/results.jsonl.
-// M0 measures what exists: device, load and upload. Frame/vocoder/TTFA/RTF
-// fields are null until the stages exist, so the JSON shape is fixed now.
+// Load and upload, then the utterance through Graph::synth (the serving
+// path): stage times, TTFA, RTF and the WAV's sha256. talker_ms / cp_ms stay
+// null - the frame kernel is one launch and does not split them.
 
 #include "runtime/device/device.h"
 
@@ -16,9 +17,10 @@ namespace navi {
 struct BenchOptions {
     std::string model_path;
     std::string text = "The quick brown fox jumps over the lazy dog, and the bench text stays fixed.";
-    std::string voice = "voice_1";
+    std::string voice_wav = "tests/reference/voice_1.wav";   // the reference voice (manifest.json)
     std::uint64_t seed = 2;
     int repeats = 1;
+    int warmup = 1;                                          // untimed utterances first (DESIGN 2)
 };
 
 struct BenchResult {

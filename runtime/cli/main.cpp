@@ -59,7 +59,7 @@ int usage(const char * argv0) {
     std::fprintf(stderr,
         "navi-tts %s (%s, ROCm %s, %s)\n"
         "usage: %s info  [--model FILE] [--upload] [-v]\n"
-        "       %s bench --model FILE [--out results.jsonl] [--repeats N]\n"
+        "       %s bench --model FILE [--out results.jsonl] [--repeats N] [--voice REF.wav] [--seed N]\n"
         "       %s synth --model FILE --text TEXT (--voice REF.wav | --speaker EMB.npy) --out out.wav [--seed N] [--language L] [--max-frames N] [--greedy]\n"
         "       %s serve --model FILE [--voices DIR] [--default-voice ID] [--model-id ID] [--host 127.0.0.1] [--port 8080] [--xtts-port 8020] [--xtts-fallback-male ID] [--xtts-fallback-female ID] [--max-frames 600] [--no-warmup] [-V]\n"
         "       %s voices [--voices DIR] list\n"
@@ -220,6 +220,9 @@ int cmd_bench(const Args & a) {
     navi::BenchOptions opt;
     opt.model_path = a.model;
     opt.repeats = a.repeats;
+    if (!a.voice.empty()) opt.voice_wav = a.voice;
+    if (!a.text.empty()) opt.text = a.text;
+    if (a.seed) opt.seed = a.seed;
     for (int i = 0; i < a.repeats; ++i) {
         const navi::BenchResult r = navi::run_bench(dev, opt);
         const std::string line = r.to_json();
@@ -229,8 +232,10 @@ int cmd_bench(const Args & a) {
             std::ofstream f(a.out, std::ios::app);
             if (!f) navi::fail("cannot open " + a.out + " for append");
             f << line << '\n';
-            std::fprintf(stderr, "appended to %s: upload %.0f ms, %.1f GB/s\n", a.out.c_str(), r.load_upload_ms,
-                         r.upload_gbps);
+            std::fprintf(stderr, "appended to %s: %d frames, prefill %.1f ms, %.2f ms/frame, vocoder %.2f ms/frame, ttfa %.0f ms, RTF %.3f, sha %s\n",
+                         a.out.c_str(), r.n_frames.value_or(0), r.prefill_ms.value_or(0), r.frame_ms.value_or(0),
+                         r.vocoder_ms_per_frame.value_or(0), r.ttfa_ms.value_or(0), r.rtf.value_or(0),
+                         r.wav_sha256.value_or("-").substr(0, 12).c_str());
         }
     }
     return 0;

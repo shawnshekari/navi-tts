@@ -1,6 +1,9 @@
 #include "runtime/bench/bench.h"
 
+#include "model/qwen3tts/graph.h"
 #include "model/qwen3tts/params.h"
+#include "runtime/audio/wav.h"
+#include "runtime/voices/store.h"
 #include "navi/build_info.h"
 #include "runtime/common/error.h"
 #include "runtime/weights/device_weights.h"
@@ -115,13 +118,37 @@ BenchResult run_bench(const Device & dev, const BenchOptions & opt) {
     const auto t1 = clock::now();
     r.load_map_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
-    DeviceWeights w = DeviceWeights::upload(file);
     file.close();
+    auto graph = qwen3tts::Graph::load(dev, opt.model_path);
+    const auto & w = graph->weights();
     r.load_upload_ms = w.stats().seconds * 1e3;
     r.weight_bytes   = w.stats().bytes;
     r.upload_gbps    = w.stats().seconds > 0 ? (w.stats().bytes / 1e9) / w.stats().seconds : 0.0;
 
-    // M1: prefill, frames, vocoder, WAV sha256 go here, on the serving code path.
+    // The utterance, exactly as the server runs it: the model's sampling
+    // defaults, the reference voice, the fixed seed.
+    const auto ref = audio::to_rate(audio::read_wav(opt.voice_wav), params.spk_sample_rate);
+    const std::vector<float> speaker = graph->embed_speaker(ref.pcm);
+    qwen3tts::SynthRequest sr;
+    sr.text = opt.text;
+    sr.speaker = speaker;
+    sr.seed = opt.seed;
+    sr.sampling.temperature = params.temperature;
+    sr.sampling.top_k = params.top_k;
+    sr.sampling.repetition_penalty = params.repetition_penalty;
+    sr.sampling.cp_temperature = params.cp_temperature;
+    sr.sampling.cp_top_k = params.cp_top_k;
+    std::vector<float> pcm;
+    for (int i = 0; i < opt.warmup; ++i) graph->synth(sr, pcm);
+    const qwen3tts::SynthStats st = graph->synth(sr, pcm);
+    r.prefill_ms = st.prefill_ms;
+    r.n_frames = st.n_frames;
+    r.frame_ms = st.n_frames ? st.frames_ms / st.n_frames : 0.0;
+    r.vocoder_ms_per_frame = st.n_frames ? st.vocoder_ms / st.n_frames : 0.0;
+    r.ttfa_ms = st.ttfa_ms;
+    r.rtf = st.rtf;
+    const auto bytes = audio::wav_bytes(audio::to_s16(pcm), params.codec_sample_rate);
+    r.wav_sha256 = voices::Store::sha256_hex(bytes);
     return r;
 }
 
