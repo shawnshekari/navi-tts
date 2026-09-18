@@ -242,11 +242,14 @@ engine change.
 
 | | gfx1100 | gfx1151 |
 |---|---|---|
-| Frame (talker + cp) | ≤ 8.5 ms at M1 (parity with the fork); goal ~7.5 | measure at M3, then set |
-| Vocoder | ~1.2 ms/frame | measure |
-| TTFA, streaming | < 300 ms | < 500 ms |
-| RTF, queue median under llama-server contention | ≤ 0.12 | ≤ 0.5 is the usefulness bar |
-| First request after start | no slower than steady state (warm-up) | same |
+| Frame (talker + cp) | ≤ 8.5 ms at M1 (parity with the fork); goal ~7.5 — **6.24 ms at M2** | measure at M3, then set |
+| Vocoder | ~1.2 ms/frame — 1.28 streaming, 1.03 whole-body | measure |
+| TTFA, streaming | < 300 ms — **58 ms** | < 500 ms |
+| RTF, queue median under llama-server contention | ≤ 0.12 — **0.099 quiet, 0.30 under a 745 GB/s hog** | ≤ 0.5 is the usefulness bar |
+| First request after start | no slower than steady state (warm-up) — met | same |
+
+Measured at M2 (2026-09-17, `bench/results.jsonl`, WAV sha unchanged through
+every step). `docs/tuning.md` records what moved the numbers and what did not.
 
 Numbers go on the README front page from the bench harness, per release.
 
@@ -307,6 +310,11 @@ to `bench/results.jsonl`; the README table is generated from that file.
 - **OPEN: 1.7B.** Same architecture scaled; RTF 3.0 on the fork's Vulkan path in
   June, never tried on HIP. Support via config is nearly free; tuning is not.
   Recommendation: load it as a stretch test in M3, don't target it.
+- **DECIDED: streaming batches.** Vocoder batching never changes the PCM
+  (chunked == one-shot is a gate), only when audio arrives and what the vocoder
+  costs per frame. A stream vocodes 4 frames first, then 16 (`STREAM_FIRST_BATCH`,
+  `STREAM_BATCH` in `graph.h`); a whole-body request uses the vocoder's max
+  batch. The bench measures the streaming configuration.
 - **DECIDED: ROCm floor, not a pin - 10.1 or newer.** Enforced at configure
   time (`NAVI_ROCM_MIN_VERSION`, from the install's `.info/version`) and at
   runtime (the loaded HIP runtime must be at least the one the binary was
@@ -329,6 +337,8 @@ M0-M2 are the XTX. Nothing runs on the mini PC before M3.
   `/metrics`, warm-up, runaway/contention tests green for a day. `navi-tts.service`
   replaces `tts-engine.service`; `skyrimnet-xtts-shim.service` and
   `tts-register-voices.service` retired; TTS-Player docs updated.
+  **Cut over 2026-09-17** (`docs/cutover.md`); the day's soak is the open item.
+  A first tuning pass followed the same evening (`docs/tuning.md`).
 - **M3 — Strix Halo.** Fat binary, build and bench on the mini PC, tune grid/
   spin from data, front-page numbers for both targets.
 - **M4 — levers.** Frame-kernel fusion of the host tail, spin cap from p99, ICL
