@@ -37,6 +37,11 @@ public:
                                           int max_prompt_tokens = 1024, int max_positions = 2048);
     ~Talker();
 
+    // Tensors the prefill wants adjacent in the arena so that q/k/v and
+    // gate/up run as one GEMM each (DeviceWeights::upload groups). create()
+    // checks the adjacency and uses separate GEMMs where it does not hold.
+    static DeviceWeights::Groups fused_groups(const Params & p);
+
     // Speaker-embedding cloning, streaming text mode (docs/model.md). `ids` is the
     // tokenized "<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n";
     // `language` an entry of Params::language_ids or "" for auto; `speaker` a

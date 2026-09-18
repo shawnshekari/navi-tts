@@ -15,15 +15,31 @@ constexpr std::size_t ALIGN = 256;
 constexpr std::size_t align_up(std::size_t n) { return (n + ALIGN - 1) / ALIGN * ALIGN; }
 } // namespace
 
-DeviceWeights DeviceWeights::upload(const NaviFile & file, const Select & select) {
+DeviceWeights DeviceWeights::upload(const NaviFile & file, const Select & select, const Groups & groups) {
+    std::map<std::string, const TensorInfo *> by_name;
+    std::map<std::string, std::size_t> group_of;   // member -> group index
+    for (const TensorInfo & t : file.tensors()) by_name.emplace(t.name, &t);
+    for (std::size_t g = 0; g < groups.size(); ++g)
+        for (const std::string & n : groups[g]) group_of.emplace(n, g);
+
     std::vector<const TensorInfo *> chosen;
+    std::vector<bool> group_done(groups.size(), false);
     std::size_t arena = 0, payload = 0;
-    for (const TensorInfo & t : file.tensors()) {
-        const bool take = select ? select(t) : (t.dtype != DType::U8);
-        if (!take) continue;
+    auto take = [&](const TensorInfo & t) {
+        if (!(select ? select(t) : (t.dtype != DType::U8))) return;
         chosen.push_back(&t);
         arena += align_up(t.nbytes);
         payload += t.nbytes;
+    };
+    for (const TensorInfo & t : file.tensors()) {
+        const auto g = group_of.find(t.name);
+        if (g == group_of.end()) { take(t); continue; }
+        if (group_done[g->second]) continue;
+        group_done[g->second] = true;
+        for (const std::string & n : groups[g->second]) {
+            const auto m = by_name.find(n);
+            if (m != by_name.end()) take(*m->second);
+        }
     }
 
     DeviceWeights w;

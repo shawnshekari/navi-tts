@@ -33,7 +33,7 @@ std::unique_ptr<Graph> Graph::load(const Device & dev, const std::string & navi_
         if (t.name.rfind("speaker_encoder.", 0) == 0) return true;
         if (t.name.rfind("codec.encoder.", 0) == 0) return false;   // ICL encoder: not used
         return !vocoder_owns_tensor(t.name);
-    }));
+    }, Talker::fused_groups(I.params)));
     I.talker = Talker::create(dev, *I.weights, I.params);
     I.frame = Frame::create(dev, *I.weights, I.params, fopt);
     I.vocoder = Vocoder::create(dev, file, *I.weights, I.params, vocoder_chunk);

@@ -10,6 +10,7 @@
 #include <map>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace navi {
 
@@ -29,10 +30,17 @@ struct UploadStats {
 class DeviceWeights {
 public:
     using Select = std::function<bool(const TensorInfo &)>;
+    using Groups = std::vector<std::vector<std::string>>;
 
     // Uploads every tensor `select` accepts (default: all but U8 blobs).
-    // Synchronous; the caller closes the NaviFile afterwards.
-    static DeviceWeights upload(const NaviFile & file, const Select & select = nullptr);
+    // Synchronous; the caller closes the NaviFile afterwards. Tensors are
+    // placed in file order, except that each `groups` entry is placed
+    // consecutively, in its own order, where its first member falls: a
+    // consumer that wants [q; k; v] as one matrix finds them adjacent (it
+    // still checks - a member's size that is not a multiple of the arena
+    // alignment leaves a gap). Names a group lists that are absent or not
+    // selected are skipped.
+    static DeviceWeights upload(const NaviFile & file, const Select & select = nullptr, const Groups & groups = {});
 
     ~DeviceWeights();
     DeviceWeights(DeviceWeights &&) noexcept;

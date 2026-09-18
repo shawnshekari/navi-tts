@@ -9,6 +9,7 @@
 #include <hip/hip_fp16.h>
 
 #include <cmath>
+#include <cstdio>
 
 namespace navi::qwen3tts {
 
@@ -42,14 +43,14 @@ __global__ void k_assemble_rows(const float * A, const float * B, const float * 
 // Per (position, head): RMSNorm over head_dim, RoPE at `pos0 + t`, and for
 // k/v the f16 store into the cache row. q stays f32 in place. One block per
 // position; threads sweep heads x pairs.
-__global__ void k_qk_norm_rope(float * q, float * k, const float * v, const float * q_norm, const float * k_norm,
+__global__ void k_qk_norm_rope(float * q, float * k, const float * v, int row_stride, const float * q_norm, const float * k_norm,
                                int n_head, int n_kv_head, int head_dim, float eps, double theta, int pos0,
                                unsigned short * kcache, unsigned short * vcache, int kv_dim) {
     __shared__ float red[32];
     const int t = blockIdx.x, pos = pos0 + t, half = head_dim / 2;
-    float * qr = q + static_cast<std::size_t>(t) * n_head * head_dim;
-    float * kr = k + static_cast<std::size_t>(t) * n_kv_head * head_dim;
-    const float * vr = v + static_cast<std::size_t>(t) * n_kv_head * head_dim;
+    float * qr = q + static_cast<std::size_t>(t) * row_stride;
+    float * kr = k + static_cast<std::size_t>(t) * row_stride;
+    const float * vr = v + static_cast<std::size_t>(t) * row_stride;
     // norms: one wave per head would be neater; heads are few, do them serially with the block
     for (int h = 0; h < n_head + n_kv_head; ++h) {
         float * row = h < n_head ? qr + h * head_dim : kr + (h - n_head) * head_dim;
@@ -84,14 +85,14 @@ __global__ void k_qk_norm_rope(float * q, float * k, const float * v, const floa
 // from the f16 cache. Scores in LDS (MAX_KEYS), softmax in f32.
 constexpr int MAX_KEYS = 1024;
 
-__global__ void k_prefill_attention(const float * q, const unsigned short * kcache, const unsigned short * vcache,
+__global__ void k_prefill_attention(const float * q, int q_stride, const unsigned short * kcache, const unsigned short * vcache,
                                     int n_head, int n_kv_head, int head_dim, int kv_dim, int pos0, float * out) {
     __shared__ float sc[MAX_KEYS];
     __shared__ float red[32];
     const int t = blockIdx.x, h = blockIdx.y, pos = pos0 + t;
     const int g = h / (n_head / n_kv_head);
     const int n = pos + 1;
-    const float * qh = q + (static_cast<std::size_t>(t) * n_head + h) * head_dim;
+    const float * qh = q + static_cast<std::size_t>(t) * q_stride + h * head_dim;
     const float scaling = rsqrtf(static_cast<float>(head_dim));
     float m = -INFINITY;
     for (int j = threadIdx.x; j < n; j += blockDim.x) {
@@ -118,6 +119,7 @@ __global__ void k_prefill_attention(const float * q, const unsigned short * kcac
 struct Layer {
     const float * ln1, * ln2, * q_norm, * k_norm;
     const unsigned short * wq, * wk, * wv, * wo, * wg, * wu, * wd;
+    const unsigned short * wqkv, * wgu;   // [q; k; v] and [gate; up] when adjacent in the arena, else null
 };
 
 } // namespace
@@ -142,8 +144,8 @@ struct Talker::Impl {
     Prompt prompt;
 
     // prefill scratch
-    float * x = nullptr, * n = nullptr, * q = nullptr, * k = nullptr, * v = nullptr, * att = nullptr, * gu = nullptr,
-          * logits = nullptr, * gate_tmp = nullptr;   // gate_tmp: [32][ff], the skinny GEMM's gated input
+    float * x = nullptr, * n = nullptr, * qkv = nullptr, * att = nullptr, * gu = nullptr,
+          * logits = nullptr, * gate_tmp = nullptr;   // qkv: [M][Q + 2 KV] as [q | k | v]; gate_tmp: [32][ff], the skinny GEMM's gated input
 
     template <class T> T * alloc(std::size_t n_elems) {
         void * ptr = nullptr;
@@ -185,6 +187,16 @@ struct Talker::Impl {
     }
 };
 
+DeviceWeights::Groups Talker::fused_groups(const Params & p) {
+    DeviceWeights::Groups g;
+    for (int l = 0; l < p.talker.n_layer; ++l) {
+        const std::string lp = "talker.model.layers." + std::to_string(l) + ".";
+        g.push_back({lp + "self_attn.q_proj.weight", lp + "self_attn.k_proj.weight", lp + "self_attn.v_proj.weight"});
+        g.push_back({lp + "mlp.gate_proj.weight", lp + "mlp.up_proj.weight"});
+    }
+    return g;
+}
+
 std::unique_ptr<Talker> Talker::create(const Device & dev, const DeviceWeights & w, const Params & p,
                                        int max_prompt_tokens, int max_positions) {
     std::unique_ptr<Talker> t(new Talker());
@@ -221,7 +233,15 @@ std::unique_ptr<Talker> Talker::create(const Device & dev, const DeviceWeights &
         ly.wg = f16p(lp + "mlp.gate_proj.weight");
         ly.wu = f16p(lp + "mlp.up_proj.weight");
         ly.wd = f16p(lp + "mlp.down_proj.weight");
+        ly.wqkv = (ly.wk == ly.wq + static_cast<std::size_t>(Q) * H && ly.wv == ly.wk + static_cast<std::size_t>(KV) * H) ? ly.wq : nullptr;
+        ly.wgu = (ly.wu == ly.wg + static_cast<std::size_t>(F) * H) ? ly.wg : nullptr;
         I.layers.push_back(ly);
+    }
+    {
+        int unfused = 0;
+        for (const Layer & ly : I.layers) unfused += (!ly.wqkv) + (!ly.wgu);
+        if (unfused) std::fprintf(stderr, "talker: %d of %d q/k/v and gate/up groups are not adjacent in the arena; separate GEMMs\n",
+                                  unfused, 2 * tp.n_layer);
     }
 
     I.kv.n_layer = tp.n_layer;
@@ -244,7 +264,7 @@ std::unique_ptr<Talker> Talker::create(const Device & dev, const DeviceWeights &
     I.prompt.tts_pad = I.alloc<float>(H);
 
     I.x = I.alloc<float>(M * H); I.n = I.alloc<float>(M * H);
-    I.q = I.alloc<float>(M * Q); I.k = I.alloc<float>(M * KV); I.v = I.alloc<float>(M * KV);
+    I.qkv = I.alloc<float>(M * (Q + 2 * KV));
     I.att = I.alloc<float>(M * Q); I.gu = I.alloc<float>(M * 2 * F);
     I.gate_tmp = I.alloc<float>(32 * F);
     I.logits = I.alloc<float>(M * tp.vocab);
@@ -335,25 +355,36 @@ void Talker::prefill(const Prompt & pr) {
     Impl & I = *impl_;
     const auto & tp = I.p.talker;
     const int T = pr.n_prefill, H = tp.hidden, Q = tp.n_head * tp.head_dim, KV = tp.n_kv_head * tp.head_dim, F = tp.ff;
+    const int QKV = Q + 2 * KV;
     if (T > I.kv.max_pos) fail("talker: prompt exceeds the KV cache");
     NAVI_HIP(hipEventRecord(I.ev0, I.stream));
     NAVI_HIP(hipMemcpyAsync(I.x, pr.prefill, static_cast<std::size_t>(T) * H * sizeof(float), hipMemcpyDeviceToDevice, I.stream));
     for (int l = 0; l < tp.n_layer; ++l) {
         const Layer & ly = I.layers[static_cast<std::size_t>(l)];
         k_rmsnorm<<<T, 256, 0, I.stream>>>(I.x, ly.ln1, H, tp.rms_eps, I.n);
-        I.gemm(ly.wq, nullptr, I.n, T, H, Q, I.q, Q, PRO_NONE, EPI_NONE);
-        I.gemm(ly.wk, nullptr, I.n, T, H, KV, I.k, KV, PRO_NONE, EPI_NONE);
-        I.gemm(ly.wv, nullptr, I.n, T, H, KV, I.v, KV, PRO_NONE, EPI_NONE);
-        k_qk_norm_rope<<<T, 128, 0, I.stream>>>(I.q, I.k, I.v, ly.q_norm, ly.k_norm, tp.n_head, tp.n_kv_head,
+        // q, k, v as one GEMM into [q | k | v] rows when the weights are adjacent
+        float * q = I.qkv, * k = I.qkv + Q, * v = I.qkv + Q + KV;
+        if (ly.wqkv) {
+            I.gemm(ly.wqkv, nullptr, I.n, T, H, QKV, I.qkv, QKV, PRO_NONE, EPI_NONE);
+        } else {
+            I.gemm(ly.wq, nullptr, I.n, T, H, Q, q, QKV, PRO_NONE, EPI_NONE);
+            I.gemm(ly.wk, nullptr, I.n, T, H, KV, k, QKV, PRO_NONE, EPI_NONE);
+            I.gemm(ly.wv, nullptr, I.n, T, H, KV, v, QKV, PRO_NONE, EPI_NONE);
+        }
+        k_qk_norm_rope<<<T, 128, 0, I.stream>>>(q, k, v, QKV, ly.q_norm, ly.k_norm, tp.n_head, tp.n_kv_head,
                                                   tp.head_dim, tp.rms_eps, tp.rope_theta, 0,
                                                   I.kv.k[static_cast<std::size_t>(l)], I.kv.v[static_cast<std::size_t>(l)], KV);
-        k_prefill_attention<<<dim3(T, tp.n_head), 128, 0, I.stream>>>(I.q, I.kv.k[static_cast<std::size_t>(l)],
+        k_prefill_attention<<<dim3(T, tp.n_head), 128, 0, I.stream>>>(q, QKV, I.kv.k[static_cast<std::size_t>(l)],
                                                                          I.kv.v[static_cast<std::size_t>(l)], tp.n_head,
                                                                          tp.n_kv_head, tp.head_dim, KV, 0, I.att);
         I.gemm(ly.wo, nullptr, I.att, T, Q, H, I.x, H, PRO_NONE, EPI_RESIDUAL, I.x);
         k_rmsnorm<<<T, 256, 0, I.stream>>>(I.x, ly.ln2, H, tp.rms_eps, I.n);
-        I.gemm(ly.wg, nullptr, I.n, T, H, F, I.gu, 2 * F, PRO_NONE, EPI_NONE);
-        I.gemm(ly.wu, nullptr, I.n, T, H, F, I.gu + F, 2 * F, PRO_NONE, EPI_NONE);
+        if (ly.wgu) {
+            I.gemm(ly.wgu, nullptr, I.n, T, H, 2 * F, I.gu, 2 * F, PRO_NONE, EPI_NONE);
+        } else {
+            I.gemm(ly.wg, nullptr, I.n, T, H, F, I.gu, 2 * F, PRO_NONE, EPI_NONE);
+            I.gemm(ly.wu, nullptr, I.n, T, H, F, I.gu + F, 2 * F, PRO_NONE, EPI_NONE);
+        }
         I.gemm(ly.wd, nullptr, I.gu, T, F, H, I.x, H, PRO_SILU_GATE, EPI_RESIDUAL, I.x, 2 * F);
     }
     k_rmsnorm<<<T, 256, 0, I.stream>>>(I.x, I.final_norm, H, tp.rms_eps, I.n);
