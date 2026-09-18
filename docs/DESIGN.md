@@ -172,8 +172,10 @@ by `grid.sync()`: talker layer × 28 → norm → cb0 logits → sample on devic
 step embedding → cp layer × 5, × 15 steps, sampling each → write 16 codes.
 Hidden state and step embeddings never leave the device between phases.
 
-- **1 block per CU**, grid = CU count from `hipDeviceProp` (96 / 40), not a
-  compile-time constant. Block size and per-phase work split derive from it.
+- **1 block per multiprocessor**, grid = `multiProcessorCount` from
+  `hipDeviceProp` - which on RDNA3 counts WGPs, not CUs: 48 on the XTX (the
+  fork's "1/CU = 48 blocks"), 20 expected on Strix Halo - never a compile-time
+  constant. Block size and per-phase work split derive from it.
 - Barrier spin cap set from measured p99, not a guess (the fork ran 0.5 s; data
   suggested ~50 ms). A timed-out barrier sets an abort flag; every block exits;
   the request fails with a clear error; nothing is latched for the next request.
@@ -216,7 +218,14 @@ engine change.
    `tools/dump_reference.py` against the HF model (upstream's reference scripts
    are not carried over).
 2. **Parity gates**, as the fork used: hidden within 0.02%, logits within 0.05%,
-   greedy codes match 15/15 on the first frames, vocoder PCM within 1e-4.
+   greedy codes match 15/15 on the first frames. Vocoder: within 2e-5 of the
+   reference decoded at the same weight precision (kernel exactness) and
+   >= 60 dB SNR against float32 (the weight budget). **DECIDED 2026-09-17:
+   codec weights stay f16** - 65 dB / 3.5e-3 max against float32, all of it
+   quantisation, inaudible in A/B and the precision production has always
+   run at; `convert.py --codec-dtype f32` reaches 1e-4 at ~2x the vocoder
+   time (0.86 -> 1.82 ms/frame untuned) and +229 MB VRAM, for anyone who
+   wants the number.
    Greedy is a code-for-code gate only: argmax decoding of this model collapses
    into silence codes after ~10 frames and never emits EOS, so a greedy run
    that sounds like nothing is correct, not a bug. Listen to the seeded sampled

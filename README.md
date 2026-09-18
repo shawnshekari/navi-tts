@@ -25,6 +25,9 @@ once, offline:
 
     cd tools && uv sync && uv run convert.py ../models/Qwen3-TTS-12Hz-0.6B-Base ../models/qwen3-tts-0.6b-f16.navi
 
+(`--codec-dtype f32` keeps the vocoder at float32: bit-closer to PyTorch, ~2x
+the vocoder time, not audible - DESIGN 6.)
+
 `docs/DESIGN.md` is the design, `docs/model.md` the model, `docs/navi-format.md`
 the weight file.
 
