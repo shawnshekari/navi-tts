@@ -12,8 +12,14 @@ preserving. Numbers are `navi-tts bench` on the XTX, streaming configuration,
 | sampler: radix select + draw over candidates | `0b25a25` | 7.56 | 63 | 0.116 |
 | matvec 2 rows × 4 loads in flight per wave | `e8872cd` | 6.46 | 59 | 0.102 |
 | barrier on one monotonic counter | `cf18dfd` | 6.24 | 58 | 0.099 |
+| conv kernel: conflict-free weight tile, vector staging, static dilation | `5aa11e7` | 6.13 | 41 | 0.088 |
 
 Whole-body requests (the queue) sit ~0.004 below the streaming RTF.
+
+The conv change moved everything but the frame: vocoder 1.30 -> 0.62 ms/frame,
+prefill 25.7 -> 14.2 ms. One kernel serves the vocoder's convs and GEMMs, the
+talker prefill and the speaker encoder, so a fix aimed at the k=7 convs
+landed on all of them.
 
 ## How the frame was measured
 
@@ -46,18 +52,30 @@ that is ~530 GB/s end to end, ~707 inside the matvec phases. The card sustains
   than R2 U4 in the microbench.
 - On RDNA3 `clock64()` does not count shader cycles; spin loops use
   `wall_clock64()` (the hog learned this the hard way).
+- **Register-blocking the conv kernel (8×4, 8×8, 16×4 thread tiles)**: the
+  premise was wrong. The kernel was not LDS-bandwidth-bound; its weight loads
+  were 16-way bank-conflicted (56-dword lane stride), its fully unrolled 16×7
+  inner loop cost 154 VGPRs for 8 accumulators, and its staging spent more
+  instructions than its FMAs. Every wider tile spilled and ran slower. With
+  those three fixed the 4×2 tile is within noise of the wider ones; a
+  64×128 8×4 tile wins only on dilation 9 at 96-192 channels (~0.03 ms/frame,
+  not worth a second instantiation). `bench/micro/conv7.hip`.
+- **Unrolling the conv's channel-chunk loop** at all: u1 < u2 < u4 < u16, every
+  step. The unrolled loads hoist into registers and occupancy pays.
 
 ## What is left
 
 Ordered, with gates and expected numbers: `docs/tuning-todo.md`.
 
-- **Vocoder k=7 convs** (`k_conv<K=7>`, 40 of the vocoder's 90 ms per 70
-  frames): the kernel is LDS-bound - a 4×2 thread tile does 6 LDS loads per
-  8 FMAs. Register blocking (8×4 or 8×8) with the same per-output summation
-  order is bit-exact; ~5 % of RTF.
-- **Prefill** (25.7 ms, 44 % of TTFA): its GEMMs run through the same conv
-  kernel at ~60 GB/s. A matvec-style skinny GEMM would take TTFA to ~46 ms.
-  RTF unaffected.
+- **Vocoder**, now 0.62 ms/frame: the k=7 group is ~19 of the ~43 ms per 70
+  frames and runs at 13-19 TFLOP/s on the wide layers, roughly half of the
+  card's single-issue f32 rate. What is left there is VALU issue (the f16
+  unpack per tap, ~25 % of the loop) and the two `__syncthreads` per 16-
+  channel chunk. ~2 % of RTF at most; not next.
+- **Prefill** (14.2 ms, 35 % of TTFA): the K=1 GEMMs still stage the weight
+  tile once per 32-row tile through LDS. For a prompt of a few dozen tokens
+  that is one row tile, so it is a weight stream at the staging loop's pace.
+  A matvec-style path for T ≤ 32 would be the next TTFA lever; RTF unaffected.
 - **int8 code-predictor weights**: the only lever left on the frame itself
   (2.4 of the 3.3 GB per frame is the code predictor, streamed 15×). A model
   change - not bit-exact, needs the listen test and a parity number. M4.

@@ -2,11 +2,12 @@
 
 The next steps after M2's first pass (`docs/tuning.md` is the record of what
 already moved and what did not). Ordered by payoff per hour, bit-exact work
-first. Numbers are the XTX at `cf18dfd`: frame 6.24 ms, vocoder 1.28 ms/frame
-streaming, prefill 25.7 ms, TTFA 58 ms, RTF 0.099, WAV sha `4cb7232a…`.
+first. Numbers are the XTX at `5aa11e7`: frame 6.13 ms, vocoder 0.62 ms/frame
+streaming, prefill 14.2 ms, TTFA 41 ms, RTF 0.088, WAV sha `4cb7232a…`.
 
-Per-frame budget for reference: 83.3 ms of audio at 12 Hz costs ~8.25 ms wall —
-frame 6.24, vocoder 1.28, prefill amortised 0.37, host tail ~0.1.
+Per-frame budget for reference: 83.3 ms of audio at 12 Hz costs ~7.3 ms wall —
+frame 6.13, vocoder 0.62, prefill amortised 0.2, host tail ~0.1. The frame
+kernel is now 84 % of it.
 
 ## Before any of it
 
@@ -26,33 +27,39 @@ frame 6.24, vocoder 1.28, prefill amortised 0.37, host tail ~0.1.
 Each item below keeps the bench WAV's sha256 unless it says otherwise. A step
 that changes the sha needs a listen test and a parity number before it lands.
 
-## 1. Vocoder k=7 convs — bit-exact, ≈0.004 RTF
+## 1. Vocoder k=7 convs — done 2026-09-18, `5aa11e7`
 
-`k_conv<K=7>` is 40 of the vocoder's 90 ms per 70 frames. The kernel
-(`model/qwen3tts/kernels.h:54`) is LDS-bound: a 4×2 thread tile does 6 LDS
-loads per 8 FMAs.
+Predicted ≈0.004 RTF from register blocking; got 0.011 RTF from something
+else. The premise ("LDS-bound, 6 loads per 8 FMAs") was wrong: the weight
+loads were 16-way bank-conflicted, the full unroll cost 154 VGPRs, and the
+staging loop out-instructed the FMAs. Fixed all three in the shared kernel
+(padded weight rows, no unroll for K > 1, 8-byte/float4 staging, dilation as
+a template argument), tile unchanged. k=7 group 9.4 → 4.3 ms per 16-frame
+chunk; vocoder 1.30 → 0.62 ms/frame; and because the kernel also runs the
+prefill GEMMs, prefill 26.6 → 14.2 ms and TTFA 59 → 41. 12/12 WAVs
+identical, sha unchanged. Record: `docs/tuning.md`, `bench/micro/conv7.hip`.
 
-- [ ] Register-block the inner loop to 8×4 (then try 8×8), keeping the
-      per-output summation order — `acc[r][c] += w * xv` over `ci`, then `j` —
-      so the result is bit-identical.
-- [ ] Watch LDS per block: `xs[WIN][CC]` grows with `(K-1)*MAX_DIL`; an 8×8
-      tile at CT=64 may cost occupancy. Measure, don't assume.
-- **Gate:** `tests/test_vocoder.cpp` green, bench WAV sha unchanged.
-- **Expected:** k=7 group 40 → ~20 ms per 70 frames, RTF 0.099 → ~0.095.
+- [x] Microbench at the real shapes, variants checked bit-exact first.
+- [x] Production kernel, five gates, 12 seed × text `cmp`, bench rows.
+- [ ] *(follow-up, low value)* a second tile (64×128, 8×4) for dilation 9 at
+      96–192 channels: ~0.03 ms/frame. Only if the vocoder is ever the item.
 
-## 2. Prefill GEMMs — bit-exact, TTFA 58 → ~46 ms
+## 2. Prefill — TTFA 41 → ~30 ms, bit-exact
 
-Prefill is 25.7 ms, 44 % of TTFA, and its GEMMs run through the same conv
-kernel at K=1 (`model/qwen3tts/talker.hip:161`) at ~60 GB/s.
+Item 1 took prefill from 26.6 to 14.2 ms on its own (the K=1 GEMMs share the
+kernel), past this item's original ~46 ms TTFA target. What is left: a
+prompt of a few dozen tokens is one 32-row tile, so each GEMM is a single
+pass over its weights at the staging loop's pace, through LDS it does not
+need.
 
-- [ ] Route the K=1 prompt GEMMs through a matvec-style skinny GEMM — the
-      2 rows × 4 loads in flight per wave shape that took the frame's matvec to
-      707 GB/s (`e8872cd`), widened to the prompt's token count.
-- [ ] `bench/micro/matvec.hip` first, at the prefill's real shapes, from a
-      buffer larger than the 96 MB Infinity Cache.
+- [ ] Measure first: add the K=1 shapes at T = 16/32/64 to
+      `bench/micro/conv7.hip` (or a sibling) and get the GB/s. If the GEMMs
+      already stream near the matvec's ~700 GB/s, this item is closed.
+- [ ] If not: a T ≤ 32 path that reads the weight row straight from global
+      memory into registers (the frame's matvec shape, `e8872cd`) with the
+      activations in LDS — same per-output order, bit-exact.
 - **Gate:** `tests/test_prefill.cpp` green, WAV sha unchanged.
-- **Expected:** TTFA ~46 ms. RTF moves ~0.003 (prefill is amortised over the
-  request); this one is for the queue's felt latency, not throughput.
+- **Expected:** TTFA ~30 ms if prefill halves again. RTF moves ~0.002.
 
 ## 3. Contention RTF — investigation, no expected gain yet
 
