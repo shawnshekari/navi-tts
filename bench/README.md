@@ -6,8 +6,9 @@ line per `navi-tts bench` run, appended by the harness itself:
     ./build/xtx/navi-tts bench --model models/qwen3-tts-0.6b-f16.navi --out bench/results.jsonl
 
 Only append from a clean checkout (`git` field without `-dirty`) with
-`tts-engine` stopped and the card otherwise quiet (CLAUDE.md); numbers taken
-under contention or with weights spilled to GTT are not comparable.
+`navi-tts` (and `tts-queue`) stopped and the card otherwise quiet (CLAUDE.md); numbers taken
+under contention or with weights spilled to GTT are not comparable (on Strix
+Halo everything is GTT by design - the 512 MiB carve-out - so that check does not apply).
 
 Fields: `ts`, `git`, `gfx`, `rocm`, `hip_runtime`, `device`, `multiprocessors`,
 `model`, `dtype`, `weight_bytes`, `load_map_ms`, `load_upload_ms`,
