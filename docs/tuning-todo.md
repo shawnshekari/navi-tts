@@ -10,15 +10,18 @@ frame 6.24, vocoder 1.28, prefill amortised 0.37, host tail ~0.1.
 
 ## Before any of it
 
-- [ ] **Finish M2's day-long soak.** The open item from the cutover
-      (`docs/DESIGN.md` §10). Nothing here is worth starting while the
-      production number is unconfirmed over a full day. Check
-      `navi_tts_barrier_timeouts` and the frame-cap counter in `/metrics`, not
-      just "it sounded fine".
-- [ ] **Re-confirm the bench protocol.** `navi-tts` stopped, card quiet, three
-      runs, `grep drm-resident /proc/<pid>/fdinfo/*` to rule out GTT spill
-      (CLAUDE.md). Ask before stopping the service; restore it after. Every row
-      lands in `bench/results.jsonl` with its git hash.
+- [ ] **M2's day-long soak** - deferred 2026-09-18 (the service will not see
+      real use until later; the tuning work does not wait on it). When it
+      runs: `navi_tts_barrier_timeouts` and the frame-cap counter in
+      `/metrics`, not just "it sounded fine".
+- [x] **Re-confirm the bench protocol.** Done 2026-09-18: `navi-tts` and
+      `tts-queue` stopped, `llama-server` + `embedding-server` left resident
+      and idle (0 % busy, as for every earlier row), three runs, bench process
+      peaked at 2741 MiB VRAM / 8 MiB GTT - no spill. Frame 6.14-6.17 ms,
+      TTFA 59, RTF 0.099, sha unchanged: `cf18dfd` reproduces. Note the `git`
+      field is compiled in at build time (`cmake/build_info.cmake`), so a row
+      tags the commit the binary was *built* at, and the dirty flag is
+      build-time too - rebuild after committing, then bench.
 
 Each item below keeps the bench WAV's sha256 unless it says otherwise. A step
 that changes the sha needs a listen test and a parity number before it lands.
