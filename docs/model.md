@@ -18,8 +18,12 @@ what the engine actually reads; this file is the human copy.
 | Codec encoder | not converted by default (ICL cloning is OPEN) | — | `codec.encoder.*` |
 
 Safetensors dtypes: the main checkpoint is BF16 throughout, the codec F32.
-Converted: F16 for ≥2-D tensors, F32 for 1-D. No value in the BF16 checkpoint
-exceeds the F16 range.
+Converted: F16 for ≥2-D tensors, F32 for 1-D. Every BF16 value is exactly
+representable in F16 (8-bit mantissa into 11, same exponent range in
+practice; none exceed 65504), so the talker, code predictor and speaker
+encoder weights in the `.navi` are bit-identical to the checkpoint - the
+engine's only error sources there are f16 KV storage and accumulation order.
+The codec is the one component that loses precision at F16 (DESIGN 6).
 
 ## Talker
 

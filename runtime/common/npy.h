@@ -5,7 +5,10 @@
 #include "runtime/common/error.h"
 
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <iterator>
+#include <map>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -98,6 +101,70 @@ struct Npy {
         f.read(reinterpret_cast<char *>(n.data.data()), static_cast<std::streamsize>(n.data.size()));
         if (!f) fail("npy: short read in " + path);
         return n;
+    }
+};
+
+// .npz written by np.savez: ZIP_STORED entries, sizes taken from the central
+// directory (numpy streams entries, so local headers carry no sizes; zip64
+// extras are honoured).
+struct Npz {
+    static std::map<std::string, Npy> load(const std::string & path) {
+        std::ifstream f(path, std::ios::binary);
+        if (!f) fail("npz: cannot open " + path);
+        std::string all((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        auto u16 = [&](std::size_t at) { std::uint16_t v; std::memcpy(&v, &all[at], 2); return v; };
+        auto u32 = [&](std::size_t at) { std::uint32_t v; std::memcpy(&v, &all[at], 4); return v; };
+        auto u64 = [&](std::size_t at) { std::uint64_t v; std::memcpy(&v, &all[at], 8); return v; };
+        // end of central directory
+        std::size_t eocd = std::string::npos;
+        for (std::size_t p = all.size() - 22; p + 22 <= all.size() && p > 0; --p) {
+            if (u32(p) == 0x06054b50) { eocd = p; break; }
+        }
+        if (eocd == std::string::npos) fail("npz: no central directory in " + path);
+        std::uint64_t n_entries = u16(eocd + 10), cd = u32(eocd + 16);
+        if (cd == 0xFFFFFFFFu) {   // zip64: locator precedes the EOCD
+            const std::size_t loc = eocd - 20;
+            if (u32(loc) != 0x07064b50) fail("npz: bad zip64 locator");
+            const std::uint64_t z64 = u64(loc + 8);
+            if (u32(static_cast<std::size_t>(z64)) != 0x06064b50) fail("npz: bad zip64 EOCD");
+            n_entries = u64(static_cast<std::size_t>(z64) + 32);
+            cd = u64(static_cast<std::size_t>(z64) + 48);
+        }
+        std::map<std::string, Npy> out;
+        std::size_t p = static_cast<std::size_t>(cd);
+        for (std::uint64_t e = 0; e < n_entries; ++e) {
+            if (u32(p) != 0x02014b50) fail("npz: bad central directory entry");
+            const std::uint16_t method = u16(p + 10), name_len = u16(p + 28), extra_len = u16(p + 30), comment_len = u16(p + 32);
+            std::uint64_t comp = u32(p + 20), local = u32(p + 42);
+            const std::string name = all.substr(p + 46, name_len);
+            // zip64 extra: fields present only for those that are 0xFFFFFFFF, in order size, comp, offset
+            std::size_t x = p + 46 + name_len;
+            const std::size_t xend = x + extra_len;
+            while (x + 4 <= xend) {
+                const std::uint16_t id = u16(x), len = u16(x + 2);
+                if (id == 0x0001) {
+                    std::size_t q = x + 4;
+                    if (u32(p + 24) == 0xFFFFFFFFu) q += 8;           // uncompressed size
+                    if (comp == 0xFFFFFFFFu) { comp = u64(q); q += 8; }
+                    if (local == 0xFFFFFFFFu) { local = u64(q); q += 8; }
+                }
+                x += 4 + len;
+            }
+            if (method != 0) fail("npz: compressed entry " + name + " not supported");
+            const std::size_t lp = static_cast<std::size_t>(local);
+            if (u32(lp) != 0x04034b50) fail("npz: bad local header for " + name);
+            const std::size_t data = lp + 30 + u16(lp + 26) + u16(lp + 28);
+            const std::string tmp = path + "." + name + ".tmp";
+            {
+                std::ofstream t(tmp, std::ios::binary);
+                t.write(&all[data], static_cast<std::streamsize>(comp));
+            }
+            const std::string key = name.size() > 4 && name.compare(name.size() - 4, 4, ".npy") == 0 ? name.substr(0, name.size() - 4) : name;
+            out[key] = Npy::load(tmp);
+            std::remove(tmp.c_str());
+            p += 46 + name_len + extra_len + comment_len;
+        }
+        return out;
     }
 };
 
