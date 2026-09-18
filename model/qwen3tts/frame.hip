@@ -24,7 +24,7 @@ constexpr int CP_MAX_LAYERS = 8;
 constexpr int CP_POS = 16;          // hidden, cb0, then 14 fed-back codes
 constexpr int CP_HEADS = 15;        // codebooks 1..15
 constexpr int VEC_MAX = 4096;       // largest LDS vector: ff 3072, vocab 3072
-constexpr int MV_ROWS = 4;
+constexpr int MV_ROWS = 2;         // rows per wave in a matvec: 2 rows x 4 loads in flight streams ~20% faster than 4 x 2 (bench/README)
 
 struct TlParams { int hidden, n_head, n_kv_head, head_dim, ff, vocab, n_layer; float eps, rope_theta; };
 struct CpParams { int hidden, n_head, n_kv_head, head_dim, ff, vocab, n_layer; float eps, rope_theta; };
@@ -137,7 +137,7 @@ __device__ __forceinline__ void wave_dot_rows(const uint16_t * W, int row0, int 
     const int lane = threadIdx.x % warpSize;
 #pragma unroll
     for (int r = 0; r < R; ++r) acc[r] = 0.f;
-#pragma unroll 2
+#pragma unroll 4
     for (int c = lane * 8; c < n_cols; c += warpSize * 8) {
         uint4 u[R];
 #pragma unroll

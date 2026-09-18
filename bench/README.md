@@ -23,3 +23,6 @@ fixed batch instead (32 = a whole-body request, the queue's case).
 The bench text and seed are the same ones `tools/dump_reference.py` uses
 (`tests/reference/manifest.json`), so a `wav_sha256` change is either an
 intended arithmetic change or a bug (DESIGN 6.3).
+
+`micro/` holds the standalone HIP microbenchmarks behind kernel decisions
+(matvec shape, sampling). They are not built by CMake; each file says how.
