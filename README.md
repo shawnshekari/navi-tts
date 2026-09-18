@@ -18,6 +18,8 @@ memory-bandwidth-bound, so the kernels are built around that.
     cmake --preset xtx && cmake --build --preset xtx
     ./build/xtx/navi-tts info --model models/qwen3-tts-0.6b-f16.navi --upload
     ctest --preset xtx          # parity gates against tests/reference
+    ./build/xtx/navi-tts synth --model models/qwen3-tts-0.6b-f16.navi --voice ref24k.wav --text "Hello." --seed 2 --out hello.wav
+    ./build/xtx/navi-tts serve --model models/qwen3-tts-0.6b-f16.navi --port 8090 -V
 
 The preset picks the ROCm clang from `~/tools/therock-tarball/install` for
 host and device code; no `hipcc`, no system compiler. Weights are converted
