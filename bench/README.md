@@ -13,7 +13,9 @@ Fields: `ts`, `git`, `gfx`, `rocm`, `hip_runtime`, `device`, `multiprocessors`,
 `model`, `dtype`, `weight_bytes`, `load_map_ms`, `load_upload_ms`,
 `upload_gbps`, then the stage numbers `prefill_ms`, `frame_ms`, `talker_ms`,
 `cp_ms`, `vocoder_ms_per_frame`, `ttfa_ms`, `rtf`, `n_frames`, `wav_sha256`
-(`null` until the stage exists - M1), and the fixed `text` / `seed`.
+(`talker_ms` / `cp_ms` stay `null`: one launch per frame, not split), and the
+fixed `text` / `seed`. `tools/bench_table.py` regenerates the README table
+from this file; never type numbers into the README.
 
 The bench text and seed are the same ones `tools/dump_reference.py` uses
 (`tests/reference/manifest.json`), so a `wav_sha256` change is either an

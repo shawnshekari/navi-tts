@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+"""Regenerate the README front-page table from bench/results.jsonl.
+
+Per gfx target, the latest git hash that has results is the release; the row
+shows the median over that hash's runs (ms/frame, vocoder, TTFA, RTF) and the
+hash. Rows for targets without results keep their dashes. Runs with a
+"-dirty" hash are ignored (bench/README.md).
+
+    uv run tools/bench_table.py            # rewrites README.md in place
+    uv run tools/bench_table.py --check    # exit 1 if README.md is stale
+"""
+
+import json
+import re
+import statistics
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+TARGETS = {
+    "gfx1100": ("Workstation", "Radeon RX 7900 XTX (gfx1100, 96 CU)"),
+    "gfx1151": ("Mini PC", "Strix Halo (gfx1151, 40 CU)"),
+}
+BEGIN, END = "| Target |", "*(Numbers"
+
+
+def rows():
+    path = ROOT / "bench" / "results.jsonl"
+    runs = [json.loads(l) for l in path.read_text().splitlines() if l.strip()] if path.exists() else []
+    runs = [r for r in runs if not r["git"].endswith("-dirty") and r.get("rtf") is not None]
+    out = ["| Target | GPU | ROCm | ms/frame | Vocoder | TTFA | RTF | Build |",
+           "|---|---|---|---|---|---|---|---|"]
+    for gfx, (name, gpu) in TARGETS.items():
+        mine = [r for r in runs if r["gfx"] == gfx]
+        if not mine:
+            out.append(f"| {name} | {gpu} | — | — | — | — | — | — |")
+            continue
+        latest = mine[-1]["git"]
+        sel = [r for r in mine if r["git"] == latest]
+        med = lambda k: statistics.median(r[k] for r in sel)
+        rocm = f"≥ 10.1 (built with {latest_rocm(sel)})"
+        out.append(f"| {name} | {gpu} | {rocm} | {med('frame_ms'):.2f} ms | {med('vocoder_ms_per_frame'):.2f} ms/frame "
+                   f"| {med('ttfa_ms'):.0f} ms | {med('rtf'):.3f} | `{latest[:7]}` ×{len(sel)} |")
+    return "\n".join(out)
+
+
+def latest_rocm(sel):
+    return sel[-1]["rocm"]
+
+
+def main():
+    readme = ROOT / "README.md"
+    text = readme.read_text()
+    start = text.index(BEGIN)
+    end = text.index(END, start)
+    new = text[:start] + rows() + "\n\n" + text[end:]
+    if "--check" in sys.argv:
+        sys.exit(0 if new == text else 1)
+    readme.write_text(new)
+    print(rows())
+
+
+if __name__ == "__main__":
+    main()
