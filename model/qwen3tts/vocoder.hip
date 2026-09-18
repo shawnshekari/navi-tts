@@ -220,6 +220,7 @@ struct Vocoder::Impl {
         ConvArgs a{};
         a.W = c.W; a.bias = c.bias; a.x = x_in; a.hist = c.hist; a.T_in = T_in; a.Cin = c.Cin; a.Cout = c.Cout;
         a.dil = c.dil; a.x_stride = x_stride; a.phases = c.phases; a.y = y; a.y_stride = y_stride;
+        a.pad_left = (c.K - 1) * c.dil; a.reflect = 0;
         a.snake_a = c.snake_a; a.snake_b = c.snake_b; a.residual = residual; a.scale = scale;
         const dim3 grid((T_in + TT - 1) / TT, (c.Cout + CT - 1) / CT, c.phases);
         const dim3 block(NTHREADS);

@@ -25,8 +25,9 @@ namespace navi::qwen3tts::kern {
 
 constexpr int TT = 32, CT = 64, CC = 16, NTHREADS = 256, MAX_DIL = 9;
 
-enum Pro { PRO_NONE = 0, PRO_SNAKE = 1, PRO_SILU_GATE = 2 };
-enum Epi { EPI_NONE = 0, EPI_GELU = 1, EPI_RESIDUAL = 2, EPI_SCALE_RESIDUAL = 3, EPI_CLAMP = 4, EPI_SILU = 5 };
+enum Pro { PRO_NONE = 0, PRO_SNAKE = 1, PRO_SILU_GATE = 2, PRO_ADD2 = 3 };
+enum Epi { EPI_NONE = 0, EPI_GELU = 1, EPI_RESIDUAL = 2, EPI_SCALE_RESIDUAL = 3, EPI_CLAMP = 4, EPI_SILU = 5,
+           EPI_RELU = 6, EPI_SIGMOID = 7, EPI_RELU_TANH = 8 };
 
 template <class WT> __device__ __forceinline__ float wload(WT v);
 template <> __device__ __forceinline__ float wload<unsigned short>(unsigned short v) { return dev::half_bits_to_float(v); }
@@ -36,8 +37,11 @@ struct ConvArgs {
     const void * W;             // [phases][Cout][Cin][K], f16 or f32
     const float * bias;         // [Cout] or null
     const float * x;            // [T_in][x_stride]
-    const float * hist;         // [H][Cin] or null
+    const float * hist;         // [H][Cin] or null (causal convs)
+    const float * x2;           // PRO_ADD2: second input, same stride, added to x before the conv
     int T_in, Cin, Cout, dil, x_stride, phases;
+    int pad_left;               // (K-1)*dil for causal, (K-1)*dil/2 for "same"
+    int reflect;                // out-of-range rows mirror (PyTorch padding_mode="reflect") instead of hist/zero
     float * y;                  // rows t*phases + phase, stride y_stride
     int y_stride;
     const float * snake_a;      // exp(alpha)         [Cin]
@@ -56,20 +60,27 @@ __global__ void __launch_bounds__(NTHREADS) k_conv(ConvArgs a) {
     const int t0 = blockIdx.x * TT, co0 = blockIdx.y * CT;
     const int tid = threadIdx.x;
     const int tl = (tid / 32) * 4, cl = (tid % 32) * 2;
-    const int H = (K - 1) * a.dil, win = TT + H;
+    const int H = (K - 1) * a.dil, win = TT + H;   // window rows; row 0 is t0 - pad_left
     const WT * Wp = static_cast<const WT *>(a.W) + static_cast<std::size_t>(phase) * a.Cout * a.Cin * K;
     float acc[4][2] = {};
 
     for (int ci0 = 0; ci0 < a.Cin; ci0 += CC) {
         for (int i = tid; i < win * CC; i += NTHREADS) {
-            const int r = i / CC, c = i % CC, ci = ci0 + c, t = t0 - H + r;
+            const int r = i / CC, c = i % CC, ci = ci0 + c;
+            int t = t0 - a.pad_left + r;
             float v = 0.f;
             if (ci < a.Cin) {
+                if (a.reflect) {
+                    if (t < 0) t = -t;
+                    if (t >= a.T_in) t = 2 * (a.T_in - 1) - t;
+                }
                 if (t >= 0 && t < a.T_in) {
                     const float * row = a.x + static_cast<std::size_t>(t) * a.x_stride;
                     if (PRO == PRO_SILU_GATE) {
                         const float g = row[ci];
                         v = g / (1.f + __expf(-g)) * row[a.Cin + ci];
+                    } else if (PRO == PRO_ADD2) {
+                        v = row[ci] + a.x2[static_cast<std::size_t>(t) * a.x_stride + ci];
                     } else {
                         v = row[ci];
                     }
@@ -126,6 +137,12 @@ __global__ void __launch_bounds__(NTHREADS) k_conv(ConvArgs a) {
                 v = fminf(fmaxf(v, -1.f), 1.f);
             } else if (EPI == EPI_SILU) {
                 v = v / (1.f + __expf(-v));
+            } else if (EPI == EPI_RELU) {
+                v = fmaxf(v, 0.f);
+            } else if (EPI == EPI_SIGMOID) {
+                v = 1.f / (1.f + __expf(-v));
+            } else if (EPI == EPI_RELU_TANH) {
+                v = tanhf(fmaxf(v, 0.f));
             }
             a.y[orow * a.y_stride + co] = v;
         }

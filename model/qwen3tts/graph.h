@@ -6,6 +6,7 @@
 
 #include "model/qwen3tts/frame.h"
 #include "model/qwen3tts/params.h"
+#include "model/qwen3tts/speaker.h"
 #include "model/qwen3tts/talker.h"
 #include "model/qwen3tts/tokenizer.h"
 #include "model/qwen3tts/vocoder.h"
@@ -49,6 +50,9 @@ public:
     const Params & params() const;
     const Tokenizer & tokenizer() const;
     const DeviceWeights & weights() const;
+
+    // Speaker embedding from mono 24 kHz audio (a clone). Runs once per voice.
+    std::vector<float> embed_speaker(std::span<const float> wav_24k);
 
     // Synthesises `req`; every vocoder batch's PCM (24 kHz f32) goes to `on_pcm`
     // as it is produced. Throws navi::Error on a failed frame (barrier timeout).

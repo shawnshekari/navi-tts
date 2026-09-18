@@ -14,6 +14,7 @@ struct Graph::Impl {
     std::unique_ptr<Talker> talker;
     std::unique_ptr<Frame> frame;
     std::unique_ptr<Vocoder> vocoder;
+    std::unique_ptr<SpeakerEncoder> speaker;
     std::vector<std::int32_t> codes;
     std::vector<float> pcm;
 };
@@ -36,6 +37,7 @@ std::unique_ptr<Graph> Graph::load(const Device & dev, const std::string & navi_
     I.talker = Talker::create(dev, *I.weights, I.params);
     I.frame = Frame::create(dev, *I.weights, I.params, fopt);
     I.vocoder = Vocoder::create(dev, file, *I.weights, I.params, vocoder_chunk);
+    I.speaker = SpeakerEncoder::create(dev, *I.weights, I.params);
     file.close();
     return g;
 }
@@ -45,6 +47,7 @@ Graph::~Graph() = default;
 const Params & Graph::params() const { return impl_->params; }
 const Tokenizer & Graph::tokenizer() const { return *impl_->tokenizer; }
 const DeviceWeights & Graph::weights() const { return *impl_->weights; }
+std::vector<float> Graph::embed_speaker(std::span<const float> wav) { return impl_->speaker->embed(wav); }
 
 SynthStats Graph::synth(const SynthRequest & req, const std::function<void(std::span<const float>)> & on_pcm) {
     using clock = std::chrono::steady_clock;

@@ -28,7 +28,8 @@ struct Args {
     std::string model;
     std::string out;
     std::string text;
-    std::string speaker;        // .npy [hidden] until the speaker encoder lands
+    std::string speaker;        // .npy [hidden] embedding
+    std::string voice;          // reference WAV (24 kHz mono) to clone
     std::string language = "english";
     std::uint64_t seed = 0;
     int max_frames = 600;
@@ -43,7 +44,7 @@ int usage(const char * argv0) {
         "navi-tts %s (%s, ROCm %s, %s)\n"
         "usage: %s info  [--model FILE] [--upload] [-v]\n"
         "       %s bench --model FILE [--out results.jsonl] [--repeats N]\n"
-        "       %s synth --model FILE --text TEXT --speaker EMB.npy --out out.wav [--seed N] [--language L] [--max-frames N] [--greedy]\n"
+        "       %s synth --model FILE --text TEXT (--voice REF.wav | --speaker EMB.npy) --out out.wav [--seed N] [--language L] [--max-frames N] [--greedy]\n"
         "       %s serve ...            (M2)\n",
         NAVI_GIT_HASH, NAVI_GPU_ARCHS, NAVI_ROCM_VERSION, NAVI_BUILD_TYPE, argv0, argv0, argv0, argv0);
     return 2;
@@ -64,6 +65,7 @@ Args parse(int argc, char ** argv) {
         else if (s == "--repeats") a.repeats = std::stoi(next("--repeats"));
         else if (s == "--text") a.text = next("--text");
         else if (s == "--speaker") a.speaker = next("--speaker");
+        else if (s == "--voice") a.voice = next("--voice");
         else if (s == "--language") a.language = next("--language");
         else if (s == "--seed") a.seed = std::stoull(next("--seed"));
         else if (s == "--max-frames") a.max_frames = std::stoi(next("--max-frames"));
@@ -186,14 +188,24 @@ int cmd_bench(const Args & a) {
 }
 
 int cmd_synth(const Args & a) {
-    if (a.model.empty() || a.text.empty() || a.speaker.empty() || a.out.empty()) {
-        navi::fail("synth needs --model, --text, --speaker and --out");
+    if (a.model.empty() || a.text.empty() || (a.speaker.empty() && a.voice.empty()) || a.out.empty()) {
+        navi::fail("synth needs --model, --text, --voice or --speaker, and --out");
     }
     navi::Device dev = navi::Device::open();
     const auto t0 = std::chrono::steady_clock::now();
     auto graph = navi::qwen3tts::Graph::load(dev, a.model);
     const double load_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-    const auto spk = navi::Npy::load(a.speaker).as_f32();
+    std::vector<float> spk;
+    if (!a.voice.empty()) {
+        const auto wav = navi::audio::read_wav(a.voice);
+        if (wav.sample_rate != graph->params().spk_sample_rate) {
+            navi::fail(a.voice + " is " + std::to_string(wav.sample_rate) + " Hz; the reference must be " +
+                       std::to_string(graph->params().spk_sample_rate) + " Hz (ffmpeg -ar 24000 -ac 1)");
+        }
+        spk = graph->embed_speaker(wav.pcm);
+    } else {
+        spk = navi::Npy::load(a.speaker).as_f32();
+    }
 
     navi::qwen3tts::SynthRequest req;
     req.text = a.text;
