@@ -2,12 +2,12 @@
 
 The next steps after M2's first pass (`docs/tuning.md` is the record of what
 already moved and what did not). Ordered by payoff per hour, bit-exact work
-first. Numbers are the XTX at `5aa11e7`: frame 6.13 ms, vocoder 0.62 ms/frame
-streaming, prefill 14.2 ms, TTFA 41 ms, RTF 0.088, WAV sha `4cb7232a…`.
+first. Numbers are the XTX at `e64cc29`: frame 6.13 ms, vocoder 0.61 ms/frame
+streaming, prefill 7.7 ms, TTFA 35 ms, RTF 0.086, WAV sha `4cb7232a…`.
 
 Per-frame budget for reference: 83.3 ms of audio at 12 Hz costs ~7.3 ms wall —
-frame 6.13, vocoder 0.62, prefill amortised 0.2, host tail ~0.1. The frame
-kernel is now 84 % of it.
+frame 6.13, vocoder 0.61, prefill amortised 0.1, host tail ~0.1. The frame
+kernel is now 88 % of it.
 
 ## Before any of it
 
@@ -44,22 +44,25 @@ identical, sha unchanged. Record: `docs/tuning.md`, `bench/micro/conv7.hip`.
 - [ ] *(follow-up, low value)* a second tile (64×128, 8×4) for dilation 9 at
       96–192 channels: ~0.03 ms/frame. Only if the vocoder is ever the item.
 
-## 2. Prefill — TTFA 41 → ~30 ms, bit-exact
+## 2. Prefill — done 2026-09-18, `e64cc29`
 
-Item 1 took prefill from 26.6 to 14.2 ms on its own (the K=1 GEMMs share the
-kernel), past this item's original ~46 ms TTFA target. What is left: a
-prompt of a few dozen tokens is one 32-row tile, so each GEMM is a single
-pass over its weights at the staging loop's pace, through LDS it does not
-need.
+Predicted TTFA ~30 from a matvec-style GEMM; got 35. The measure-first step
+found the prefill GEMMs at 60-130 GB/s and a 10-row prompt (the text rides
+in as trailing rows). `k_gemm_skinny` (lane per prompt row, f32 weight
+tile, gate as its own pass) took the GEMMs 11.7 → 5.5 ms, prefill 14.2 →
+7.7, TTFA 41 → 35, bit-exact (12/12 WAVs, sha). It does not reach the
+matvec's bandwidth and the record says why: the bit-exact rule leaves a
+10-row GEMM with 1-2 waves per SIMD of dependent chains stalling on LDS;
+four mappings and every latency-hiding trick land at 150-240 GB/s
+(`docs/tuning.md`, `bench/micro/gemm_skinny.hip`).
 
-- [ ] Measure first: add the K=1 shapes at T = 16/32/64 to
-      `bench/micro/conv7.hip` (or a sibling) and get the GB/s. If the GEMMs
-      already stream near the matvec's ~700 GB/s, this item is closed.
-- [ ] If not: a T ≤ 32 path that reads the weight row straight from global
-      memory into registers (the frame's matvec shape, `e8872cd`) with the
-      activations in LDS — same per-output order, bit-exact.
-- **Gate:** `tests/test_prefill.cpp` green, WAV sha unchanged.
-- **Expected:** TTFA ~30 ms if prefill halves again. RTF moves ~0.002.
+- [x] Measure first (T = 10, shapes, GB/s), variants memcmp'd against `k_conv`.
+- [x] Production kernel, gates, 12 seed × text `cmp`, bench rows.
+- [ ] *(follow-up, ~1 ms TTFA)* fuse q/k/v and gate/up into one launch
+      each: weights concatenated at upload, stride arguments on
+      `k_qk_norm_rope`; ~15 % of the GEMMs and 84 fewer launches.
+- [ ] *(follow-up, small)* `EPI_SCALE_RESIDUAL` / `EPI_GELU` on
+      `k_gemm_skinny` so the vocoder transformer's T = 4/16 GEMMs use it.
 
 ## 3. Contention RTF — investigation, no expected gain yet
 

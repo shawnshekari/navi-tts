@@ -13,6 +13,7 @@ preserving. Numbers are `navi-tts bench` on the XTX, streaming configuration,
 | matvec 2 rows × 4 loads in flight per wave | `e8872cd` | 6.46 | 59 | 0.102 |
 | barrier on one monotonic counter | `cf18dfd` | 6.24 | 58 | 0.099 |
 | conv kernel: conflict-free weight tile, vector staging, static dilation | `5aa11e7` | 6.13 | 41 | 0.088 |
+| prefill: skinny GEMM, lane per prompt row | `e64cc29` | 6.13 | 35 | 0.086 |
 
 Whole-body requests (the queue) sit ~0.004 below the streaming RTF.
 
@@ -62,6 +63,15 @@ that is ~530 GB/s end to end, ~707 inside the matvec phases. The card sustains
   not worth a second instantiation). `bench/micro/conv7.hip`.
 - **Unrolling the conv's channel-chunk loop** at all: u1 < u2 < u4 < u16, every
   step. The unrolled loads hoist into registers and occupancy pays.
+- **Streaming the prefill GEMMs at the matvec's ~700 GB/s.** Not reachable
+  under the bit-exact rule at T = 10: one lane must own each (t, co) dot
+  product end to end, so a GEMM has Cout/R waves of dependent chains - 1-2
+  per SIMD - and they stall on LDS reads (273 `s_waitcnt` per 2952 ISA
+  instructions). Four mappings (lane per row with f16 or f32 tiles, lane per
+  channel, quad-coalesced with DPP exchange), deeper prefetch, register
+  double-buffering and occupancy hints all sit at 150-240 GB/s where pure
+  streams do 450-730. Fusing q/k/v and gate/up measured ~15 % on top.
+  `bench/micro/gemm_skinny.hip`.
 
 ## What is left
 
@@ -72,10 +82,14 @@ Ordered, with gates and expected numbers: `docs/tuning-todo.md`.
   card's single-issue f32 rate. What is left there is VALU issue (the f16
   unpack per tap, ~25 % of the loop) and the two `__syncthreads` per 16-
   channel chunk. ~2 % of RTF at most; not next.
-- **Prefill** (14.2 ms, 35 % of TTFA): the K=1 GEMMs still stage the weight
-  tile once per 32-row tile through LDS. For a prompt of a few dozen tokens
-  that is one row tile, so it is a weight stream at the staging loop's pace.
-  A matvec-style path for T ≤ 32 would be the next TTFA lever; RTF unaffected.
+- **Prefill** (7.7 ms, 22 % of TTFA): the GEMMs are ~5.5 of it at 150-240
+  GB/s, the ceiling for a bit-exact 10-row GEMM (above). Left: fuse q/k/v and
+  gate/up (~15 % of the GEMMs, needs the weights concatenated at load and
+  strides on the rope kernel); the non-GEMM 2 ms (norms, rope, attention,
+  199 launch gaps). TTFA levers only; RTF unaffected.
+- **Vocoder transformer K=1 GEMMs** at T = 4 and 16 still go through
+  `k_conv`; `k_gemm_skinny` needs `EPI_SCALE_RESIDUAL` and `EPI_GELU` to take
+  them. Small, but on the TTFA path (the first 4-frame batch).
 - **int8 code-predictor weights**: the only lever left on the frame itself
   (2.4 of the 3.3 GB per frame is the code predictor, streamed 15×). A model
   change - not bit-exact, needs the listen test and a parity number. M4.
