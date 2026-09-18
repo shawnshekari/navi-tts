@@ -68,35 +68,29 @@ struct Work {
     float * step_out;
     volatile unsigned * bar;           // [0] count, [1] sense, [2] abort
     unsigned long long spin_cap;
+#ifdef NAVI_FRAME_PROFILE
+    unsigned long long * prof;   // [2*i]: block 0 arrives at barrier i, [2*i+1]: it is released
+#endif
 };
 
 // --- device helpers ---------------------------------------------------------
 
-// Deadline-aware sense-reversing grid barrier. Returns false once any block
-// has waited past spin_cap; every later barrier then short-circuits so the
-// whole grid unwinds instead of deadlocking.
+// Deadline-aware grid barrier on one monotonic counter: a block's target is
+// the next multiple of nblocks past the value its arrival returned, so the
+// last arriver writes nothing extra and waiters spin on the same word (the
+// sense-reversing form cost two more writes and a fence on the critical
+// path: 0.81 us, this 0.6). Returns false once any block has waited past
+// spin_cap; every later barrier then short-circuits so the whole grid
+// unwinds instead of deadlocking. bar[0]: arrivals, bar[2]: abort.
 __device__ __forceinline__ bool grid_barrier(volatile unsigned * bar, unsigned nblocks, unsigned long long spin_cap) {
-    __shared__ unsigned lsense;
     __syncthreads();
-    if (threadIdx.x == 0) {
-        if (bar[2]) {
-            lsense = bar[1];
-        } else {
-            const unsigned s = bar[1];
-            __threadfence();
-            const unsigned prev = atomicAdd((unsigned *) &bar[0], 1u);
-            if (prev + 1u == nblocks) {
-                bar[0] = 0u;
-                __threadfence();
-                bar[1] = s ^ 1u;
-                lsense = s ^ 1u;
-            } else {
-                unsigned long long spins = 0;
-                while (bar[1] == s && !bar[2]) {
-                    if (++spins >= spin_cap) { bar[2] = 1u; break; }
-                }
-                lsense = bar[1];
-            }
+    if (threadIdx.x == 0 && !bar[2]) {
+        __threadfence();
+        const unsigned prev = atomicAdd((unsigned *) &bar[0], 1u);
+        const unsigned target = (prev / nblocks + 1u) * nblocks;
+        unsigned long long spins = 0;
+        while (bar[0] < target && !bar[2]) {
+            if (++spins >= spin_cap) { bar[2] = 1u; break; }
         }
     }
     __syncthreads();
@@ -153,6 +147,9 @@ __device__ __forceinline__ void wave_dot_rows(const uint16_t * W, int row0, int 
 }
 
 // y[row] (=, or += when ACCUMULATE) W*xs over all rows, partitioned across the grid's waves
+// in cycling groups of MV_ROWS. (A balanced contiguous partition, and fusing
+// q/k/v into one virtual matvec, were measured 2026-09-17: no change - the
+// phase ends when the memory system does, not when the last wave does.)
 template <bool ACCUMULATE>
 __device__ void grid_matvec(const uint16_t * W, int n_rows, int n_cols, const float * xs, float * y) {
     const int lane = threadIdx.x % warpSize, wpb = blockDim.x / warpSize;
@@ -515,7 +512,14 @@ __global__ void __launch_bounds__(BLOCK) k_frame(TlParams TP, TlWeights TW, CpPa
     __shared__ float red[32];
     __shared__ SampleScratch samp;
     const unsigned nb = gridDim.x;
+#ifdef NAVI_FRAME_PROFILE
+    int prof_i = 0;
+#define GBSYNC() do { if (blockIdx.x == 0 && threadIdx.x == 0) B.prof[2 * prof_i] = wall_clock64(); \
+                      if (!grid_barrier(B.bar, nb, B.spin_cap)) return; \
+                      if (blockIdx.x == 0 && threadIdx.x == 0) B.prof[2 * prof_i + 1] = wall_clock64(); ++prof_i; } while (0)
+#else
 #define GBSYNC() do { if (!grid_barrier(B.bar, nb, B.spin_cap)) return; } while (0)
+#endif
 
     if (B.skip_talker) {
         // frame 0: the prefill's last position already gave hidden and logits
@@ -598,6 +602,47 @@ struct Frame::Impl {
         return static_cast<T *>(ptr);
     }
 
+#ifdef NAVI_FRAME_PROFILE
+    // Phase names in barrier order: the talker (6 per layer) then the code predictor.
+    void dump_profile(int frame_index) {
+        static std::vector<unsigned long long> h(2 * 4096);
+        NAVI_HIP(hipMemcpy(h.data(), B.prof, h.size() * sizeof(unsigned long long), hipMemcpyDeviceToHost));
+        int khz = 0;
+        NAVI_HIP(hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, 0));
+        const double us_per_tick = 1e3 / khz;
+        std::vector<std::string> names;
+        if (B.skip_talker) names.push_back("tl:copy");
+        else {
+            names.push_back("tl:step_in");
+            for (int il = 0; il < TP.n_layer; ++il) for (const char * n : {"tl:qkv", "tl:norm_rope", "tl:attend", "tl:wo", "tl:gate_up", "tl:down"}) names.push_back(n);
+            names.push_back("tl:head");
+        }
+        names.push_back("tl:sample");
+        for (int pos = 0; pos < CP_POS; ++pos) {
+            names.push_back("cp:embed");
+            for (int il = 0; il < CP.n_layer; ++il) for (const char * n : {"cp:qkv", "cp:norm_rope", "cp:attend", "cp:wo", "cp:gate_up", "cp:down"}) names.push_back(n);
+            names.push_back("cp:head");
+            names.push_back("cp:sample");
+        }
+        names.push_back("assemble");
+        std::map<std::string, std::pair<double, double>> acc;   // name -> (phase us, barrier wait us)
+        std::map<std::string, int> cnt;
+        double total_phase = 0, total_wait = 0;
+        for (std::size_t i = 0; i < names.size(); ++i) {
+            const double release_prev = i == 0 ? 0 : static_cast<double>(h[2 * (i - 1) + 1]);
+            const double arrive = static_cast<double>(h[2 * i]), release = static_cast<double>(h[2 * i + 1]);
+            if (i == 0) continue;
+            const double phase = (arrive - release_prev) * us_per_tick, wait = (release - arrive) * us_per_tick;
+            acc[names[i]].first += phase; acc[names[i]].second += wait; cnt[names[i]]++;
+            total_phase += phase; total_wait += wait;
+        }
+        if (frame_index != 8) return;   // one representative frame
+        std::fprintf(stderr, "frame %d profile (block 0): %.0f us in phases + %.0f us waiting at %zu barriers\n", frame_index, total_phase, total_wait, names.size());
+        std::fprintf(stderr, "  %-14s %5s %9s %9s %9s\n", "phase", "n", "phase us", "wait us", "us each");
+        for (const auto & [n, v] : acc) std::fprintf(stderr, "  %-14s %5d %9.0f %9.0f %9.2f\n", n.c_str(), cnt[n], v.first, v.second, v.first / cnt[n]);
+    }
+#endif
+
     FrameResult launch(const Sampling & s, uint64_t seed, int frame_index) {
         FrameResult r;
         B.temperature = s.temperature; B.top_k = s.top_k; B.repetition_penalty = s.repetition_penalty;
@@ -622,6 +667,9 @@ struct Frame::Impl {
         std::memcpy(r.codes, h_codes, sizeof(r.codes));
         r.eos = r.codes[0] == B.eos_id;
         r.ok = true;
+#ifdef NAVI_FRAME_PROFILE
+        dump_profile(frame_index);
+#endif
         return r;
     }
 };
@@ -698,6 +746,9 @@ std::unique_ptr<Frame> Frame::create(const Device & dev, const DeviceWeights & w
     B.codes = I.alloc<int32_t>(CP_POS);
     B.step_out = I.alloc<float>(tp.hidden);
     B.bar = I.alloc<unsigned>(3);
+#ifdef NAVI_FRAME_PROFILE
+    B.prof = I.alloc<unsigned long long>(2 * 4096);
+#endif
     B.eos_id = p.codec_eos_id;
     B.suppress_from = tp.vocab - 1024;   // HF: suppress_tokens = range(vocab - 1024, vocab) minus EOS
     B.spin_cap = opt.spin_cap;

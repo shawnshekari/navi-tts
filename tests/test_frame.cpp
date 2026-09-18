@@ -11,6 +11,7 @@
 #include "runtime/weights/device_weights.h"
 #include "runtime/weights/navi_file.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -95,9 +96,31 @@ int main(int argc, char ** argv) {
                     a == b ? "bit-identical" : "DIFFERENT", c.size() / 16, a == c ? "identical to seed 2 (!)" : "differs");
         const bool det_ok = a == b && a != c && !a.empty();
 
+        // The barrier's deadline (CLAUDE.md: a cooperative kernel must never be able
+        // to hang the box): with a spin cap far below a frame's ~700 barriers' worth
+        // of waiting, the frame must come back as a failure, promptly, and a normal
+        // Frame must still work afterwards.
+        bool timeout_ok = false;
+        {
+            navi::qwen3tts::FrameOptions tight;
+            tight.spin_cap = 1;
+            auto tf = navi::qwen3tts::Frame::create(dev, w, params, tight);
+            talker->prefill(pr);
+            tf->reset();
+            const auto t0 = std::chrono::steady_clock::now();
+            navi::qwen3tts::FrameResult r = tf->run_first(talker->d_hidden(), talker->d_logits(), pr.trailing, s, 0, 0);
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            timeout_ok = !r.ok && r.error.find("timed out") != std::string::npos && ms < 2000.0;
+            std::printf("spin cap 1: %s in %.0f ms (%s)\n", r.ok ? "frame SUCCEEDED (!)" : "failed cleanly", ms, r.error.c_str());
+            talker->prefill(pr);
+            frame->reset();
+            r = frame->run_first(talker->d_hidden(), talker->d_logits(), pr.trailing, s, 0, 0);
+            if (!r.ok) { std::printf("frame after the timeout FAILED: %s\n", r.error.c_str()); timeout_ok = false; }
+        }
+
         // gate (DESIGN 6): the first frames match code-for-code; a later divergence in a greedy
         // chain is a near-tie flipping under f16 KV / accumulation order, not a bug by itself.
-        const bool ok = matched_frames >= 2 && det_ok;
+        const bool ok = matched_frames >= 2 && det_ok && timeout_ok;
         std::printf("%s\n", ok ? "PASS" : "FAIL");
         return ok ? 0 : 1;
     } catch (const std::exception & e) {
