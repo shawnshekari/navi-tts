@@ -1,0 +1,31 @@
+# navi-tts user unit. Install: cp to ~/.config/systemd/user/, daemon-reload,
+# enable --now. Replaces tts-engine.service, skyrimnet-xtts-shim.service and
+# tts-register-voices.service (DESIGN 3.2, 3.3, 10 M2).
+[Unit]
+Description=navi-tts (Qwen3-TTS on HIP)
+After=network.target
+# Small and latency-sensitive: claim VRAM before the LLM services load, or it
+# gets pushed into GTT and runs at half speed. Ordering only, not a dependency.
+Before=llama-server.service embedding-server.service
+# Replaces all three; never two listeners on :8080 / :8020.
+Conflicts=tts-engine.service skyrimnet-xtts-shim.service tts-register-voices.service
+
+[Service]
+Type=simple
+# Host therock ROCm libs: the ld cache only carries the old system libamdhip64;
+# systemd does not source ~/.bashrc.
+Environment=LD_LIBRARY_PATH=/home/sreed/tools/therock-tarball/install/lib:/home/sreed/tools/therock-tarball/install/llvm/lib
+# Navi 31 has 4 HW compute queues; llama-server and embedding-server cap at 1
+# each. Without a matching cap the old engine oversubscribed the rest under
+# heavy concurrent load (2026-09-12: amdgpu page faults, a stuck queue).
+Environment=GPU_MAX_HW_QUEUES=1
+ExecStart=%h/src/navi-tts/build/xtx/navi-tts serve \
+    --model %h/src/navi-tts/models/qwen3-tts-0.6b-f16.navi \
+    --voices %h/.local/share/navi-tts/voices \
+    --port 8080 --xtts-port 8020 --max-frames 600 -V
+TimeoutStopSec=30
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

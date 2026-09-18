@@ -1,0 +1,12 @@
+# navi-tts /metrics -> node_exporter textfile collector (user unit).
+[Unit]
+Description=navi-tts /metrics -> node_exporter textfile collector
+After=node_exporter.service navi-tts.service
+
+[Service]
+ExecStart=%h/src/navi-tts/deploy/navi_tts_metrics_textfile.sh %h/.local/share/node_exporter/textfile 8080
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
