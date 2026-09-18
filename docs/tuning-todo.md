@@ -2,8 +2,8 @@
 
 The next steps after M2's first pass (`docs/tuning.md` is the record of what
 already moved and what did not). Ordered by payoff per hour, bit-exact work
-first. Numbers are the XTX at `e64cc29`: frame 6.13 ms, vocoder 0.61 ms/frame
-streaming, prefill 7.7 ms, TTFA 35 ms, RTF 0.086, WAV sha `4cb7232a…`.
+first. Numbers are the XTX at `c01b791`: frame 6.13 ms, vocoder 0.62 ms/frame
+streaming, prefill 7.0 ms, TTFA 34 ms, RTF 0.086, WAV sha `4cb7232a…`.
 
 Per-frame budget for reference: 83.3 ms of audio at 12 Hz costs ~7.3 ms wall —
 frame 6.13, vocoder 0.61, prefill amortised 0.1, host tail ~0.1. The frame
@@ -58,9 +58,10 @@ four mappings and every latency-hiding trick land at 150-240 GB/s
 
 - [x] Measure first (T = 10, shapes, GB/s), variants memcmp'd against `k_conv`.
 - [x] Production kernel, gates, 12 seed × text `cmp`, bench rows.
-- [ ] *(follow-up, ~1 ms TTFA)* fuse q/k/v and gate/up into one launch
-      each: weights concatenated at upload, stride arguments on
-      `k_qk_norm_rope`; ~15 % of the GEMMs and 84 fewer launches.
+- [x] Fuse q/k/v and gate/up — `c01b791`: `DeviceWeights::upload` places
+      named groups adjacently in the arena, the talker checks and falls back
+      per layer. Prefill 7.7 → 7.0, TTFA 35 → 34. Fallback path exercised
+      (groups disabled: identical bytes).
 - [ ] *(follow-up, small)* `EPI_SCALE_RESIDUAL` / `EPI_GELU` on
       `k_gemm_skinny` so the vocoder transformer's T = 4/16 GEMMs use it.
 

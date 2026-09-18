@@ -14,6 +14,7 @@ preserving. Numbers are `navi-tts bench` on the XTX, streaming configuration,
 | barrier on one monotonic counter | `cf18dfd` | 6.24 | 58 | 0.099 |
 | conv kernel: conflict-free weight tile, vector staging, static dilation | `5aa11e7` | 6.13 | 41 | 0.088 |
 | prefill: skinny GEMM, lane per prompt row | `e64cc29` | 6.13 | 35 | 0.086 |
+| prefill: q/k/v and gate/up as one GEMM each | `c01b791` | 6.13 | 34 | 0.086 |
 
 Whole-body requests (the queue) sit ~0.004 below the streaming RTF.
 
@@ -82,11 +83,11 @@ Ordered, with gates and expected numbers: `docs/tuning-todo.md`.
   card's single-issue f32 rate. What is left there is VALU issue (the f16
   unpack per tap, ~25 % of the loop) and the two `__syncthreads` per 16-
   channel chunk. ~2 % of RTF at most; not next.
-- **Prefill** (7.7 ms, 22 % of TTFA): the GEMMs are ~5.5 of it at 150-240
-  GB/s, the ceiling for a bit-exact 10-row GEMM (above). Left: fuse q/k/v and
-  gate/up (~15 % of the GEMMs, needs the weights concatenated at load and
-  strides on the rope kernel); the non-GEMM 2 ms (norms, rope, attention,
-  199 launch gaps). TTFA levers only; RTF unaffected.
+- **Prefill** (7.0 ms, 21 % of TTFA): the GEMMs are ~4.8 of it at 150-240
+  GB/s, the ceiling for a bit-exact 10-row GEMM (above); q/k/v and gate/up
+  are fused (the arena places named groups adjacently). Left: the non-GEMM
+  ~2 ms (norms, rope, attention, 115 launches). TTFA levers only; RTF
+  unaffected.
 - **Vocoder transformer K=1 GEMMs** at T = 4 and 16 still go through
   `k_conv`; `k_gemm_skinny` needs `EPI_SCALE_RESIDUAL` and `EPI_GELU` to take
   them. Small, but on the TTFA path (the first 4-frame batch).
