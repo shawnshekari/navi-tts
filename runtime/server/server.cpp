@@ -760,7 +760,34 @@ private:
 
 } // namespace
 
+// Every stage once, so the first real request runs at steady state: kernel
+// and buffer first-touch happen here, not on an utterance somebody waits for.
+void warm_up(qwen3tts::Graph & graph, const voices::Store & store, bool verbose) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const qwen3tts::Params & p = graph.params();
+    const std::vector<float> silence(static_cast<std::size_t>(p.spk_sample_rate) * 2, 0.f);
+    std::vector<float> speaker = graph.embed_speaker(silence);
+    if (const auto ids = store.ids(); !ids.empty()) speaker = store.find(ids.front())->embedding;
+    qwen3tts::SynthRequest sr;
+    sr.text = "Warm up.";
+    sr.speaker = speaker;
+    sr.max_frames = 16;
+    sr.sampling.temperature = p.temperature;
+    sr.sampling.top_k = p.top_k;
+    sr.sampling.repetition_penalty = p.repetition_penalty;
+    sr.sampling.cp_temperature = p.cp_temperature;
+    sr.sampling.cp_top_k = p.cp_top_k;
+    std::vector<float> pcm;
+    const auto st = graph.synth(sr, pcm);
+    if (verbose) {
+        std::fprintf(stderr, "warm-up: %d frames, prefill %.1f ms, %.2f ms/frame, vocoder %.1f ms; %.0f ms total\n", st.n_frames,
+                     st.prefill_ms, st.n_frames ? st.frames_ms / st.n_frames : 0.0, st.vocoder_ms,
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    }
+}
+
 int run(qwen3tts::Graph & graph, voices::Store & store, const Options & opt) {
+    if (opt.warmup) warm_up(graph, store, opt.verbose);
     Service service(graph, store, opt);
     httplib::Server svr, xtts;
     service.install(svr);

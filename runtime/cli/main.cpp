@@ -50,6 +50,7 @@ struct Args {
     std::string ref_text;
     std::vector<std::string> rest;   // positional: voices <action> [id]
     bool upload = false;
+    bool warmup = true;
     bool verbose = false;
     int repeats = 1;
 };
@@ -60,7 +61,7 @@ int usage(const char * argv0) {
         "usage: %s info  [--model FILE] [--upload] [-v]\n"
         "       %s bench --model FILE [--out results.jsonl] [--repeats N]\n"
         "       %s synth --model FILE --text TEXT (--voice REF.wav | --speaker EMB.npy) --out out.wav [--seed N] [--language L] [--max-frames N] [--greedy]\n"
-        "       %s serve --model FILE [--voices DIR] [--default-voice ID] [--model-id ID] [--host 127.0.0.1] [--port 8080] [--xtts-port 8020] [--xtts-fallback-male ID] [--xtts-fallback-female ID] [--max-frames 600] [-V]\n"
+        "       %s serve --model FILE [--voices DIR] [--default-voice ID] [--model-id ID] [--host 127.0.0.1] [--port 8080] [--xtts-port 8020] [--xtts-fallback-male ID] [--xtts-fallback-female ID] [--max-frames 600] [--no-warmup] [-V]\n"
         "       %s voices [--voices DIR] list\n"
         "       %s voices [--voices DIR] add --model FILE --name NAME --voice REF.wav [--ref-text TEXT]\n"
         "       %s voices [--voices DIR] rm ID\n"
@@ -95,6 +96,7 @@ Args parse(int argc, char ** argv) {
         else if (s == "--xtts-fallback-male") a.xtts_fallback_male = next("--xtts-fallback-male");
         else if (s == "--xtts-fallback-female") a.xtts_fallback_female = next("--xtts-fallback-female");
         else if (s == "--upload") a.upload = true;
+        else if (s == "--no-warmup") a.warmup = false;
         else if (s == "--voices") a.voices_dir = next("--voices");
         else if (s == "--default-voice") a.default_voice = next("--default-voice");
         else if (s == "--model-id") a.model_id = next("--model-id");
@@ -284,6 +286,7 @@ int cmd_serve(const Args & a) {
     opt.xtts_fallback_female = a.xtts_fallback_female;
     opt.verbose = a.verbose;
     opt.max_audio_tokens = a.max_frames;
+    opt.warmup = a.warmup;
     opt.model_id = a.model_id;
     opt.default_voice = a.default_voice;
     navi::voices::Store store = navi::voices::Store::open(a.voices_dir, graph->params().talker.hidden);

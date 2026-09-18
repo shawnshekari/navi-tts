@@ -25,6 +25,7 @@ struct Options {
     bool verbose = false;        // per-request timing on stderr
     int max_input_chars = 4096;
     int max_audio_tokens = 600;  // default per-request frame budget (DESIGN 2)
+    bool warmup = true;          // one short synth + one embed before listening (DESIGN 2, 7)
 };
 
 // Blocks until the server stops (SIGINT/SIGTERM).
