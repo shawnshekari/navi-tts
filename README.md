@@ -18,6 +18,8 @@ memory-bandwidth-bound, so the kernels are built around that.
     cmake --preset xtx && cmake --build --preset xtx
     ./build/xtx/navi-tts info --model models/qwen3-tts-0.6b-f16.navi --upload
     ctest --preset xtx          # parity gates against tests/reference
+    tests/runaway.sh 8090       # against a side-port serve: EOS, cap, bit-exact, parallel clients
+    tests/contention.sh 8090    # the same while build/xtx/gpu_hog saturates the card (briefly)
     ./build/xtx/navi-tts synth --model models/qwen3-tts-0.6b-f16.navi --voice ref.wav --text "Hello." --seed 2 --out hello.wav
     ./build/xtx/navi-tts serve --model models/qwen3-tts-0.6b-f16.navi --port 8090 -V
 

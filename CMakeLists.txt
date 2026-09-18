@@ -139,3 +139,8 @@ add_test(NAME frame COMMAND test_frame "${NAVI_TEST_MODEL}" "${CMAKE_SOURCE_DIR}
 add_executable(test_speaker tests/test_speaker.cpp)
 target_link_libraries(test_speaker PRIVATE navi_qwen3tts navi_runtime)
 add_test(NAME speaker COMMAND test_speaker "${NAVI_TEST_MODEL}" "${CMAKE_SOURCE_DIR}/tests/reference")
+
+# The contention hog (tests/contention.sh): not a ctest, run on purpose and briefly.
+add_executable(gpu_hog)
+navi_hip_sources(gpu_hog tests/gpu_hog.hip)
+target_link_libraries(gpu_hog PRIVATE navi_rocm)
