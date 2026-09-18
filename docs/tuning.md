@@ -49,6 +49,8 @@ that is ~530 GB/s end to end, ~707 inside the matvec phases. The card sustains
 
 ## What is left
 
+Ordered, with gates and expected numbers: `docs/tuning-todo.md`.
+
 - **Vocoder k=7 convs** (`k_conv<K=7>`, 40 of the vocoder's 90 ms per 70
   frames): the kernel is LDS-bound - a 4×2 thread tile does 6 LDS loads per
   8 FMAs. Register blocking (8×4 or 8×8) with the same per-output summation
