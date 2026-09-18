@@ -59,6 +59,7 @@ SynthStats Graph::synth(const SynthRequest & req, const std::function<void(std::
 
     const std::string prompt_text = "<|im_start|>assistant\n" + req.text + "<|im_end|>\n<|im_start|>assistant\n";
     const auto ids = I.tokenizer->encode(prompt_text);
+    st.tokenize_ms = ms_since(t0);
     st.n_tokens = static_cast<int>(ids.size()) - 8;
     if (st.n_tokens < 1) fail("empty text");
 

@@ -35,7 +35,7 @@ struct SynthRequest {
 struct SynthStats {
     int n_tokens = 0, n_frames = 0;
     bool hit_cap = false, eos = false;
-    double prefill_ms = 0, frames_ms = 0, vocoder_ms = 0, total_ms = 0, ttfa_ms = 0;
+    double tokenize_ms = 0, prefill_ms = 0, frames_ms = 0, vocoder_ms = 0, total_ms = 0, ttfa_ms = 0;   // prefill_ms includes tokenize_ms
     double audio_s = 0, rtf = 0;
 };
 

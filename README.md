@@ -55,6 +55,8 @@ the weight file.
   `stream_format: "audio"` (chunked WAV or, with `response_format: "pcm"`, raw
   s16le) or `"sse"` (base64 PCM events, then `speech.audio.done` with the
   timings); `stream_batch_size` frames per chunk (default 8, ~100 ms to first audio).
+  `GET /metrics` is Prometheus text (`tts:` counters per stage, TTFA and RTF
+  histograms, `_last` gauges) for the node_exporter textfile collector.
 - **Serves:** [TTS-Player](../TTS-Player) (queue, Claude Code / opencode cues) and SkyrimNet.
 
 ## Lineage

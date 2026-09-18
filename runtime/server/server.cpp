@@ -4,8 +4,11 @@
 #include "runtime/common/error.h"
 #include "runtime/common/json.h"
 
+#include "navi/build_info.h"
 #include "third_party/cpp-httplib/httplib.h"
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
@@ -17,6 +20,7 @@
 #include <mutex>
 #include <random>
 #include <initializer_list>
+#include <iterator>
 #include <thread>
 #include <vector>
 
@@ -163,6 +167,114 @@ std::string base64(const void * data, std::size_t n) {
     return out;
 }
 
+// GET /metrics (DESIGN 3.1, 7): llama.cpp's shape - `tts:` counters and
+// gauges in the text exposition format - so the existing panels carry over.
+// Bumped once per request where the stats land; no dependency.
+struct Metrics {
+    std::atomic<std::uint64_t> requests_total{0}, requests_processing{0}, clones_total{0};
+    std::atomic<std::uint64_t> prompt_tokens_total{0}, predicted_tokens_total{0}, frame_cap_hits_total{0};
+    std::atomic<double> prompt_seconds_total{0}, predicted_seconds_total{0}, audio_seconds_total{0};
+    std::atomic<double> tokenize_seconds_total{0}, encode_seconds_total{0}, generate_seconds_total{0}, vocode_seconds_total{0};
+    std::atomic<double> request_seconds_total{0}, clone_seconds_total{0};
+    // Histograms for the two numbers that matter (DESIGN 7): p50/p99 come out of
+    // histogram_quantile; the _last gauges are the instantaneous readout.
+    struct Histogram {
+        static constexpr std::size_t MAX = 12;
+        const double * bounds; std::size_t n;
+        std::atomic<std::uint64_t> bucket[MAX + 1]{};
+        std::atomic<double> sum{0}, last{0};
+        std::atomic<std::uint64_t> count{0};
+        template <std::size_t N> explicit Histogram(const double (&b)[N]) : bounds(b), n(N) { static_assert(N <= MAX); }
+        void observe(double v) {
+            std::size_t b = 0;
+            while (b < n && v > bounds[b]) ++b;
+            bucket[b]++;
+            add(sum, v);
+            last.store(v);
+            count++;
+        }
+    };
+    static constexpr double TTFA_BUCKETS[] = {0.05, 0.1, 0.2, 0.3, 0.5, 1.0, 2.0, 5.0};
+    static constexpr double RTF_BUCKETS[] = {0.05, 0.08, 0.1, 0.12, 0.15, 0.2, 0.3, 0.5, 1.0, 2.0};
+    Histogram ttfa{TTFA_BUCKETS}, rtf{RTF_BUCKETS};
+    std::map<std::string, std::atomic<std::uint64_t>> errors;   // by stage; keys fixed at construction
+
+    // request: 4xx; generate: a failed synth; stream: the client went away
+    Metrics() { for (const char * st : {"request", "clone", "generate", "stream"}) errors[st] = 0; }
+
+    static void add(std::atomic<double> & a, double v) {
+        double cur = a.load();
+        while (!a.compare_exchange_weak(cur, cur + v)) {}
+    }
+    void observe(const qwen3tts::SynthStats & st) {
+        requests_total++;
+        prompt_tokens_total += static_cast<std::uint64_t>(std::max(0, st.n_tokens));
+        predicted_tokens_total += static_cast<std::uint64_t>(std::max(0, st.n_frames));
+        if (st.hit_cap) frame_cap_hits_total++;
+        add(prompt_seconds_total, st.prefill_ms / 1e3);
+        add(predicted_seconds_total, st.frames_ms / 1e3);
+        add(audio_seconds_total, st.audio_s);
+        add(tokenize_seconds_total, st.tokenize_ms / 1e3);
+        add(encode_seconds_total, (st.prefill_ms - st.tokenize_ms) / 1e3);
+        add(generate_seconds_total, st.frames_ms / 1e3);
+        add(vocode_seconds_total, st.vocoder_ms / 1e3);
+        add(request_seconds_total, st.total_ms / 1e3);
+        if (st.ttfa_ms > 0) ttfa.observe(st.ttfa_ms / 1e3);
+        if (st.rtf > 0) rtf.observe(st.rtf);
+    }
+    void error(const std::string & stage) {
+        const auto it = errors.find(stage);
+        if (it != errors.end()) it->second++;
+    }
+
+    std::string render(const std::string & model, std::size_t voices) const {
+        std::string o;
+        auto line = [&](const char * name, const char * type, const char * help, const std::string & value, const std::string & labels = "") {
+            o += "# HELP tts:"; o += name; o += ' '; o += help; o += '\n';
+            o += "# TYPE tts:"; o += name; o += ' '; o += type; o += '\n';
+            o += "tts:"; o += name; o += labels; o += ' '; o += value; o += '\n';
+        };
+        auto u = [](std::uint64_t v) { return std::to_string(v); };
+        auto d = [](double v) { char b[32]; std::snprintf(b, sizeof b, "%.6g", v); return std::string(b); };
+        line("model_info", "gauge", "The loaded model.", "1", "{model=\"" + model + "\",git=\"" NAVI_GIT_HASH "\",gfx=\"" NAVI_GPU_ARCHS "\"}");
+        line("voices", "gauge", "Voices in the store.", u(voices));
+        line("requests_total", "counter", "Speech requests completed.", u(requests_total));
+        line("requests_processing", "gauge", "Speech requests in flight (queued on the worker or streaming).", u(requests_processing));
+        line("clones_total", "counter", "Voice clones computed (a re-registration of the same sample is not one).", u(clones_total));
+        line("clone_seconds_total", "counter", "Time in the speaker encoder.", d(clone_seconds_total));
+        line("prompt_tokens_total", "counter", "Text tokens in.", u(prompt_tokens_total));
+        line("prompt_seconds_total", "counter", "Time in tokenize + prefill.", d(prompt_seconds_total));
+        line("predicted_tokens_total", "counter", "Codec frames out (12.5 Hz).", u(predicted_tokens_total));
+        line("predicted_seconds_total", "counter", "Time in the frame loop.", d(predicted_seconds_total));
+        line("audio_seconds_total", "counter", "Audio produced; rate(request_seconds)/rate(audio_seconds) is the RTF.", d(audio_seconds_total));
+        line("request_seconds_total", "counter", "Wall time of speech requests.", d(request_seconds_total));
+        line("tokenize_seconds_total", "counter", "Stage: BPE.", d(tokenize_seconds_total));
+        line("encode_seconds_total", "counter", "Stage: prompt build + prefill.", d(encode_seconds_total));
+        line("generate_seconds_total", "counter", "Stage: frame kernel (talker + code predictor).", d(generate_seconds_total));
+        line("vocode_seconds_total", "counter", "Stage: vocoder.", d(vocode_seconds_total));
+        line("frame_cap_hits_total", "counter", "Requests that hit max_audio_tokens without EOS.", u(frame_cap_hits_total));
+        o += "# HELP tts:errors_total Failed requests by stage.\n# TYPE tts:errors_total counter\n";
+        for (const auto & [stage, n] : errors) o += "tts:errors_total{stage=\"" + stage + "\"} " + u(n) + '\n';
+        auto histogram = [&](const char * name, const char * help, const Histogram & h) {
+            o += "# HELP tts:"; o += name; o += ' '; o += help; o += "\n# TYPE tts:"; o += name; o += " histogram\n";
+            std::uint64_t cum = 0;
+            for (std::size_t b = 0; b < h.n; ++b) {
+                cum += h.bucket[b];
+                o += "tts:" + std::string(name) + "_bucket{le=\"" + d(h.bounds[b]) + "\"} " + u(cum) + '\n';
+            }
+            cum += h.bucket[h.n];
+            o += "tts:" + std::string(name) + "_bucket{le=\"+Inf\"} " + u(cum) + '\n';
+            o += "tts:" + std::string(name) + "_sum " + d(h.sum) + '\n';
+            o += "tts:" + std::string(name) + "_count " + u(h.count) + '\n';
+        };
+        histogram("ttfa_seconds", "Time to first audio (prefill + first frames + one vocoder batch).", ttfa);
+        histogram("rtf", "Real-time factor per request (wall / audio seconds).", rtf);
+        line("ttfa_seconds_last", "gauge", "Time to first audio of the last request.", d(ttfa.last));
+        line("rtf_last", "gauge", "RTF of the last request.", d(rtf.last));
+        return o;
+    }
+};
+
 const std::map<std::string, std::string> LANG_CODES = {
     {"en", "english"}, {"zh", "chinese"}, {"de", "german"}, {"it", "italian"}, {"pt", "portuguese"},
     {"es", "spanish"}, {"ja", "japanese"}, {"ko", "korean"}, {"fr", "french"}, {"ru", "russian"},
@@ -235,12 +347,11 @@ private:
         const bool replaced = store_.find(id) != nullptr;
         const auto t0 = std::chrono::steady_clock::now();
         worker_.run([&] { v.embedding = graph_.embed_speaker(wav.pcm); });
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        metrics_.clones_total++;
+        Metrics::add(metrics_.clone_seconds_total, ms / 1e3);
         auto ptr = store_.put(std::move(v), sample);
-        if (opt_.verbose) {
-            std::fprintf(stderr, "voice %s%s: %.1f s of audio, %.0f ms\n", id.c_str(), replaced ? " (replaced)" : "",
-                         ptr->sample_seconds,
-                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
-        }
+        if (opt_.verbose) std::fprintf(stderr, "voice %s%s: %.1f s of audio, %.0f ms\n", id.c_str(), replaced ? " (replaced)" : "", ptr->sample_seconds, ms);
         return {ptr, replaced ? "replaced" : "created"};
     }
 
@@ -254,6 +365,12 @@ private:
     // Fills `sp` from the common fields or reports why not (status, message).
     bool prepare(Speech & sp, const std::string & text, const std::string & voice_id, const std::string & language,
                  httplib::Response & res) {
+        const bool ok = prepare_(sp, text, voice_id, language, res);
+        if (!ok) metrics_.error("request");
+        return ok;
+    }
+    bool prepare_(Speech & sp, const std::string & text, const std::string & voice_id, const std::string & language,
+                  httplib::Response & res) {
         sp.sr.text = text;
         sp.voice_id = voice_id;
         if (sp.sr.text.empty()) { send_error(res, 400, "'input' is empty"); return false; }
@@ -281,7 +398,16 @@ private:
     void speak_wav(const Speech & sp, bool raw_pcm, httplib::Response & res) {
         std::vector<float> pcm;
         qwen3tts::SynthStats st;
-        worker_.run([&] { st = graph_.synth(sp.sr, pcm); });
+        metrics_.requests_processing++;
+        try {
+            worker_.run([&] { st = graph_.synth(sp.sr, pcm); });
+        } catch (...) {
+            metrics_.requests_processing--;
+            metrics_.error("generate");
+            throw;
+        }
+        metrics_.requests_processing--;
+        metrics_.observe(st);
         const auto s16 = audio::to_s16(pcm);
         if (raw_pcm) {
             res.set_content(reinterpret_cast<const char *>(s16.data()), s16.size() * 2, "audio/pcm");
@@ -301,6 +427,7 @@ private:
     void speak_stream(std::shared_ptr<Speech> sp, bool sse, bool raw_pcm, httplib::Response & res) {
         auto q = std::make_shared<PcmQueue>();
         auto st = std::make_shared<qwen3tts::SynthStats>();
+        metrics_.requests_processing++;
         worker_.post([this, sp, q, st] {
             std::string error;
             try {
@@ -311,8 +438,12 @@ private:
                 error = e.what();
             }
             q->finish(error);
-            if (error.empty()) log_speech(*sp, *st);
-            else if (opt_.verbose) std::fprintf(stderr, "speech %s: failed: %s\n", sp->voice_id.c_str(), error.c_str());
+            metrics_.requests_processing--;
+            if (error.empty()) { metrics_.observe(*st); log_speech(*sp, *st); }
+            else {
+                metrics_.error(q->aborted() ? "stream" : "generate");
+                if (opt_.verbose) std::fprintf(stderr, "speech %s: failed: %s\n", sp->voice_id.c_str(), error.c_str());
+            }
         });
         if (!q->wait_first()) {
             const std::string err = q->error();
@@ -378,6 +509,10 @@ private:
 
     // --- OpenAI dialect (DESIGN 3.1) ---------------------------------------
     void install_openai(httplib::Server & svr) {
+        svr.Get("/metrics", [this](const httplib::Request &, httplib::Response & res) {
+            res.set_content(metrics_.render(opt_.model_id, store_.size()), "text/plain; version=0.0.4");
+        });
+
         svr.Get("/health", [this](const httplib::Request &, httplib::Response & res) {
             Json j;
             j.set("status", "ok");
@@ -436,8 +571,10 @@ private:
                 j.set("id", r.voice->id); j.set("name", r.voice->name); j.set("status", r.status);
                 res.set_content(j.dump(), "application/json");
             } catch (const navi::Error & e) {
+                metrics_.error("clone");
                 send_error(res, 500, e.what(), "engine_error");
             } catch (const std::exception & e) {
+                metrics_.error("clone");
                 send_error(res, 400, e.what());
             }
         });
@@ -601,8 +738,10 @@ private:
                 j.set("voice_id", r.voice->id); j.set("latents", r.voice->id); j.set("message", r.status);
                 res.set_content(j.dump(), "application/json");
             } catch (const navi::Error & e) {
+                metrics_.error("clone");
                 xtts_error(res, 500, e.what());
             } catch (const std::exception & e) {
+                metrics_.error("clone");
                 xtts_error(res, 400, e.what());
             }
         };
@@ -614,6 +753,7 @@ private:
     const Options & opt_;
     const qwen3tts::Params & params_;
     Worker worker_;
+    Metrics metrics_;
     std::mt19937_64 seed_rng_;
     std::mutex rng_mutex_;
 };
