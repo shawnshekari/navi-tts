@@ -224,24 +224,28 @@ struct Vocoder::Impl {
         a.snake_a = c.snake_a; a.snake_b = c.snake_b; a.residual = residual; a.scale = scale;
         const dim3 grid((T_in + TT - 1) / TT, (c.Cout + CT - 1) / CT, c.phases);
         const dim3 block(NTHREADS);
-#define NAVI_CONV_CASE(KK, PP, EE) \
-        if (c.K == KK && pro == PP && epi == EE) { \
-            if (f32) k_conv<float, KK, PP, EE><<<grid, block, 0, stream>>>(a); \
-            else k_conv<unsigned short, KK, PP, EE><<<grid, block, 0, stream>>>(a); \
+        // the dilation is a template argument (kernels.h): 1 everywhere but the
+        // residual units' k=7 convs, which run at 1, 3 and 9
+#define NAVI_CONV_CASE(KK, DD, PP, EE) \
+        if (c.K == KK && c.dil == DD && pro == PP && epi == EE) { \
+            if (f32) k_conv<float, KK, PP, EE, DD><<<grid, block, 0, stream>>>(a); \
+            else k_conv<unsigned short, KK, PP, EE, DD><<<grid, block, 0, stream>>>(a); \
             goto launched; }
-        NAVI_CONV_CASE(1, PRO_NONE, EPI_NONE)
-        NAVI_CONV_CASE(1, PRO_NONE, EPI_GELU)
-        NAVI_CONV_CASE(1, PRO_NONE, EPI_SCALE_RESIDUAL)
-        NAVI_CONV_CASE(1, PRO_SILU_GATE, EPI_SCALE_RESIDUAL)
-        NAVI_CONV_CASE(1, PRO_SNAKE, EPI_RESIDUAL)
-        NAVI_CONV_CASE(2, PRO_SNAKE, EPI_NONE)
-        NAVI_CONV_CASE(3, PRO_NONE, EPI_NONE)
-        NAVI_CONV_CASE(7, PRO_NONE, EPI_NONE)
-        NAVI_CONV_CASE(7, PRO_SNAKE, EPI_NONE)
-        NAVI_CONV_CASE(7, PRO_SNAKE, EPI_CLAMP)
+        NAVI_CONV_CASE(1, 1, PRO_NONE, EPI_NONE)
+        NAVI_CONV_CASE(1, 1, PRO_NONE, EPI_GELU)
+        NAVI_CONV_CASE(1, 1, PRO_NONE, EPI_SCALE_RESIDUAL)
+        NAVI_CONV_CASE(1, 1, PRO_SILU_GATE, EPI_SCALE_RESIDUAL)
+        NAVI_CONV_CASE(1, 1, PRO_SNAKE, EPI_RESIDUAL)
+        NAVI_CONV_CASE(2, 1, PRO_SNAKE, EPI_NONE)
+        NAVI_CONV_CASE(3, 1, PRO_NONE, EPI_NONE)
+        NAVI_CONV_CASE(7, 1, PRO_NONE, EPI_NONE)
+        NAVI_CONV_CASE(7, 1, PRO_SNAKE, EPI_NONE)
+        NAVI_CONV_CASE(7, 3, PRO_SNAKE, EPI_NONE)
+        NAVI_CONV_CASE(7, 9, PRO_SNAKE, EPI_NONE)
+        NAVI_CONV_CASE(7, 1, PRO_SNAKE, EPI_CLAMP)
 #undef NAVI_CONV_CASE
-        fail("vocoder: no conv instantiation for K=" + std::to_string(c.K) + " pro=" + std::to_string(pro) +
-             " epi=" + std::to_string(epi));
+        fail("vocoder: no conv instantiation for K=" + std::to_string(c.K) + " dil=" + std::to_string(c.dil) +
+             " pro=" + std::to_string(pro) + " epi=" + std::to_string(epi));
     launched:
         NAVI_HIP(hipGetLastError());
         if (c.hist) hist_update(c, x_in, T_in);
