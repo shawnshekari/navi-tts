@@ -105,6 +105,7 @@ add_dependencies(navi_runtime navi_build_info)
 add_library(navi_qwen3tts STATIC
     model/qwen3tts/params.cpp
     model/qwen3tts/tokenizer.cpp
+    model/qwen3tts/graph.cpp
 )
 navi_hip_sources(navi_qwen3tts model/qwen3tts/vocoder.hip model/qwen3tts/talker.hip model/qwen3tts/frame.hip)
 target_link_libraries(navi_qwen3tts PUBLIC navi_runtime)

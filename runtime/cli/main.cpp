@@ -3,7 +3,10 @@
 //   bench  --model FILE [--out FILE]   the harness (DESIGN 7); JSON line to stdout or appended to --out
 //   serve                              M1+
 
+#include "model/qwen3tts/graph.h"
 #include "model/qwen3tts/params.h"
+#include "runtime/audio/wav.h"
+#include "runtime/common/npy.h"
 #include "navi/build_info.h"
 #include "runtime/bench/bench.h"
 #include "runtime/common/error.h"
@@ -11,6 +14,7 @@
 #include "runtime/weights/device_weights.h"
 #include "runtime/weights/navi_file.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -23,6 +27,12 @@ struct Args {
     std::string cmd;
     std::string model;
     std::string out;
+    std::string text;
+    std::string speaker;        // .npy [hidden] until the speaker encoder lands
+    std::string language = "english";
+    std::uint64_t seed = 0;
+    int max_frames = 600;
+    bool greedy = false;
     bool upload = false;
     bool verbose = false;
     int repeats = 1;
@@ -33,8 +43,9 @@ int usage(const char * argv0) {
         "navi-tts %s (%s, ROCm %s, %s)\n"
         "usage: %s info  [--model FILE] [--upload] [-v]\n"
         "       %s bench --model FILE [--out results.jsonl] [--repeats N]\n"
-        "       %s serve ...            (M1)\n",
-        NAVI_GIT_HASH, NAVI_GPU_ARCHS, NAVI_ROCM_VERSION, NAVI_BUILD_TYPE, argv0, argv0, argv0);
+        "       %s synth --model FILE --text TEXT --speaker EMB.npy --out out.wav [--seed N] [--language L] [--max-frames N] [--greedy]\n"
+        "       %s serve ...            (M2)\n",
+        NAVI_GIT_HASH, NAVI_GPU_ARCHS, NAVI_ROCM_VERSION, NAVI_BUILD_TYPE, argv0, argv0, argv0, argv0);
     return 2;
 }
 
@@ -51,6 +62,12 @@ Args parse(int argc, char ** argv) {
         if (s == "--model" || s == "-m") a.model = next("--model");
         else if (s == "--out") a.out = next("--out");
         else if (s == "--repeats") a.repeats = std::stoi(next("--repeats"));
+        else if (s == "--text") a.text = next("--text");
+        else if (s == "--speaker") a.speaker = next("--speaker");
+        else if (s == "--language") a.language = next("--language");
+        else if (s == "--seed") a.seed = std::stoull(next("--seed"));
+        else if (s == "--max-frames") a.max_frames = std::stoi(next("--max-frames"));
+        else if (s == "--greedy") a.greedy = true;
         else if (s == "--upload") a.upload = true;
         else if (s == "-v" || s == "--verbose") a.verbose = true;
         else navi::fail("unknown argument " + s);
@@ -168,6 +185,35 @@ int cmd_bench(const Args & a) {
     return 0;
 }
 
+int cmd_synth(const Args & a) {
+    if (a.model.empty() || a.text.empty() || a.speaker.empty() || a.out.empty()) {
+        navi::fail("synth needs --model, --text, --speaker and --out");
+    }
+    navi::Device dev = navi::Device::open();
+    const auto t0 = std::chrono::steady_clock::now();
+    auto graph = navi::qwen3tts::Graph::load(dev, a.model);
+    const double load_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    const auto spk = navi::Npy::load(a.speaker).as_f32();
+
+    navi::qwen3tts::SynthRequest req;
+    req.text = a.text;
+    req.language = a.language;
+    req.speaker = spk;
+    req.seed = a.seed;
+    req.max_frames = a.max_frames;
+    if (a.greedy) { req.sampling.temperature = 0.f; req.sampling.cp_temperature = 0.f; }
+    std::vector<float> pcm;
+    const auto st = graph->synth(req, pcm);
+    navi::audio::write_wav(a.out, pcm, graph->params().codec_sample_rate);
+    std::fprintf(stderr,
+                 "load %.0f ms | %d tokens, %d frames (%s) | prefill %.1f ms, frames %.1f ms (%.2f ms/frame), "
+                 "vocoder %.1f ms | ttfa %.0f ms | %.2f s audio in %.0f ms, RTF %.3f | %s\n",
+                 load_ms, st.n_tokens, st.n_frames, st.eos ? "eos" : "cap", st.prefill_ms, st.frames_ms,
+                 st.n_frames ? st.frames_ms / st.n_frames : 0.0, st.vocoder_ms, st.ttfa_ms, st.audio_s, st.total_ms,
+                 st.rtf, a.out.c_str());
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
@@ -175,6 +221,7 @@ int main(int argc, char ** argv) {
         const Args a = parse(argc, argv);
         if (a.cmd == "info") return cmd_info(a);
         if (a.cmd == "bench") return cmd_bench(a);
+        if (a.cmd == "synth") return cmd_synth(a);
         if (a.cmd == "serve") navi::fail("serve arrives at M1");
         return usage(argv[0]);
     } catch (const navi::Error & e) {
