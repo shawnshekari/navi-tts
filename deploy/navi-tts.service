@@ -1,14 +1,13 @@
 # navi-tts user unit. Install: cp to ~/.config/systemd/user/, daemon-reload,
-# enable --now. Replaces tts-engine.service, skyrimnet-xtts-shim.service and
-# tts-register-voices.service (DESIGN 3.2, 3.3, 10 M2).
+# enable --now. Replaced tts-engine.service, skyrimnet-xtts-shim.service and
+# tts-register-voices.service (DESIGN 3.2, 3.3, 10 M2); those three were removed
+# from ~/.config/systemd/user on 2026-09-19 and archived in their source repos.
 [Unit]
 Description=navi-tts (Qwen3-TTS on HIP)
 After=network.target
 # Small and latency-sensitive: claim VRAM before the LLM services load, or it
 # gets pushed into GTT and runs at half speed. Ordering only, not a dependency.
 Before=llama-server.service embedding-server.service
-# Replaces all three; never two listeners on :8080 / :8020.
-Conflicts=tts-engine.service skyrimnet-xtts-shim.service tts-register-voices.service
 
 [Service]
 Type=simple
