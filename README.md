@@ -49,6 +49,9 @@ the weight file.
 
 - **Model:** Qwen3-TTS architecture (0.6B), own weight format converted offline.
   Fine-tunes of the same architecture are just different weights.
+- **Bind:** `--host` defaults to `127.0.0.1`; the production unit passes
+  `0.0.0.0` to serve the LAN (no auth on any endpoint - LAN-trusted, same
+  tradeoff as the TTS-Player queue's daemon).
 - **API:** OpenAI-compatible `/v1/audio/speech` and `/v1/audio/voices` on `:8080`,
   plus the XTTS dialect SkyrimNet speaks (`/create_and_store_latents`,
   `/tts_to_audio/`, `/speakers`, ...) on the same port and, with
@@ -61,6 +64,9 @@ the weight file.
   `GET /metrics` is Prometheus text (`tts:` counters per stage, TTFA and RTF
   histograms, `_last` gauges) for the node_exporter textfile collector.
 - **Serves:** [TTS-Player](../TTS-Player) (queue, Claude Code / opencode cues) and SkyrimNet.
+  Production is the `navi-tts.service` user unit: `serve --host 0.0.0.0 --port 8080
+  --xtts-port 8020 --max-frames 600` with the voices dir above, which holds the
+  cloned voices plus the Skyrim voice pack the queue exposes by name.
 
 ## Lineage
 
