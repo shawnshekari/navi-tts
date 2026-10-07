@@ -2,6 +2,8 @@
 
 **AMD-first text-to-speech inference. RDNA3 (gfx1100) and Strix Halo (gfx1151), HIP only, tuned and measured. Other hardware is out of scope by design.**
 
+![navi-tts banner](docs/assets/navi-tts-banner.jpg)
+
 A small, focused engine: one binary, no CPU or Vulkan fallback, no framework
 underneath. The hot loop is hand-written HIP; the model runs at batch one and is
 memory-bandwidth-bound, so the kernels are built around that.
