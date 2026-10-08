@@ -7,14 +7,14 @@ preserving. Numbers are `navi-tts bench` on the XTX, streaming configuration,
 
 | step | commit | frame ms | TTFA ms | RTF |
 |---|---|---|---|---|
-| M2 baseline | `2d2286a` | 8.33 | 102 | 0.129 |
-| vocoder batching (4 first, then 16; max for whole-body) | `faabcaa` | 8.31 | 66 | 0.125 |
-| sampler: radix select + draw over candidates | `0b25a25` | 7.56 | 63 | 0.116 |
-| matvec 2 rows × 4 loads in flight per wave | `e8872cd` | 6.46 | 59 | 0.102 |
-| barrier on one monotonic counter | `cf18dfd` | 6.24 | 58 | 0.099 |
-| conv kernel: conflict-free weight tile, vector staging, static dilation | `5aa11e7` | 6.13 | 41 | 0.088 |
-| prefill: skinny GEMM, lane per prompt row | `e64cc29` | 6.13 | 35 | 0.086 |
-| prefill: q/k/v and gate/up as one GEMM each | `c01b791` | 6.13 | 34 | 0.086 |
+| M2 baseline | `c4ad673` | 8.33 | 102 | 0.129 |
+| vocoder batching (4 first, then 16; max for whole-body) | `e5943c6` | 8.31 | 66 | 0.125 |
+| sampler: radix select + draw over candidates | `d62eba1` | 7.56 | 63 | 0.116 |
+| matvec 2 rows × 4 loads in flight per wave | `8176c53` | 6.46 | 59 | 0.102 |
+| barrier on one monotonic counter | `d1f3e42` | 6.24 | 58 | 0.099 |
+| conv kernel: conflict-free weight tile, vector staging, static dilation | `1ff4951` | 6.13 | 41 | 0.088 |
+| prefill: skinny GEMM, lane per prompt row | `b62f218` | 6.13 | 35 | 0.086 |
+| prefill: q/k/v and gate/up as one GEMM each | `f418d80` | 6.13 | 34 | 0.086 |
 
 Whole-body requests (the queue) sit ~0.004 below the streaming RTF.
 
