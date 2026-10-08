@@ -6,7 +6,7 @@ Where navi-tts came from: the discrete-GPU and HIP work done on a fork of
 June and September 2026, before both upstreams went quiet and this project was
 started from scratch. navi-tts shares no code with that fork; this file keeps the
 reasoning - what was tried, what it measured, what broke - so it doesn't have to be
-rediscovered. The fork itself is frozen at `~/tools/qwen3-tts.cpp` (hashes below are
+rediscovered. The fork itself was a frozen local clone (hashes below are
 its), 26 commits past upstream `0c8b2ba`.
 
 ## The arc
@@ -105,9 +105,6 @@ Oldest first. Each entry is the commit's own message and file summary.
 HTTPLIB_USE_*_IF_AVAILABLE still picked up host libs and broke linking
 even with the REQUIRE_* flags off.
 
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01LeKwwRg1CJLHPqzjwUkTN6
-
 ```
  CMakeLists.txt  | 2 ++
  build-vulkan.sh | 4 +++-
@@ -125,9 +122,6 @@ device type before falling back to CPU.
 RX 7900 XTX, 0.6B F16: vocoder decode 2883 ms -> 510 ms for 5.2 s of
 audio; end-to-end RTF 0.89 -> 0.32.
 
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01LeKwwRg1CJLHPqzjwUkTN6
-
 ```
  src/gguf_loader.cpp | 10 ++++++++++
  1 file changed, 10 insertions(+)
@@ -143,9 +137,6 @@ so the whole vocoder graph stays on Vulkan (13 splits -> 2, 0 on CPU).
 
 RX 7900 XTX, 0.6B F16, 5.2 s clip: vocoder decode 510 ms -> 232 ms.
 
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01LeKwwRg1CJLHPqzjwUkTN6
-
 ```
  src/audio_tokenizer_decoder.cpp | 14 ++++++++++++--
  1 file changed, 12 insertions(+), 2 deletions(-)
@@ -158,18 +149,12 @@ Profile of one code-predictor step on RX 7900 XTX (128 dispatches, ~760 us,
 ggml graph caching, fused cooperative HIP kernel), profiling recipes, and
 what has already been ruled out.
 
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01LeKwwRg1CJLHPqzjwUkTN6
-
 ```
  docs/code_predictor_plan.md | 192 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
  1 file changed, 192 insertions(+)
 ```
 
 ### `e8076e8` 2026-09-10 - docs: upstream status and how to submit the dGPU fixes later
-
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01LeKwwRg1CJLHPqzjwUkTN6
 
 ```
  docs/code_predictor_plan.md | 53 +++++++++++++++++++++++++++++++++++++++++++++++++----
@@ -196,9 +181,6 @@ against Vulkan/RADV on the RX 7900 XTX.
 
 Also adds the benchmark harness under scripts/bench/ and ignores all
 build*/ directories.
-
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_015mm99BWBJZtrLfucF2Jeir
 
 ```
  .gitignore                    |  2 +-
@@ -237,9 +219,6 @@ RX 7900 XTX (Vulkan), RTF 0.27 -> 0.24; HIP 18.9 -> 15.2.
 Changes arithmetic order, so sampled codes for a given seed re-roll; the
 live service binary in build/ is deliberately not rebuilt yet.
 
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_015mm99BWBJZtrLfucF2Jeir
-
 ```
  docs/code_predictor_plan.md   |  66 +++++++++++++
  scripts/bench/bench_hip.sh    |  40 +++++++-
@@ -267,9 +246,6 @@ the untouched one-shot decode because Vulkan's coopmat matmul output
 depends on batch size (the streaming design was validated on Strix
 Halo). Chunked decode() vs stream_decode() at the same chunk is exact.
 
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_015mm99BWBJZtrLfucF2Jeir
-
 ```
  docs/code_predictor_plan.md     | 17 +++++++++++++++++
  src/audio_tokenizer_decoder.cpp | 32 +++++++++++++++++++++++++++++++-
@@ -287,9 +263,6 @@ six transposed convs of the vocoder took 3.6 s for 1.1 s of audio,
 directly; the summation order is unchanged, so the output is
 bit-identical. That decode now takes 19 ms, and a full request on HIP
 runs at RTF 0.205 vs 0.239 on Vulkan.
-
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_015mm99BWBJZtrLfucF2Jeir
 
 ```
  docs/code_predictor_plan.md | 19 +++++++++++++++++++
@@ -330,9 +303,6 @@ falls back to the ggml path otherwise. Code-predictor stage 10.1 -> 5.9
 ms/frame sampled; greedy reproduces the reference codes 15/15 and sampled
 fused == per-phase 15/15. test_hip_code_pred validates against a
 QWEN3_TTS_DUMP_CODE_PRED reference frame. Seed re-audition: seed 3 keeper.
-
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_015mm99BWBJZtrLfucF2Jeir
 
 ```
  CMakeLists.txt               |  25 +++
@@ -394,7 +364,6 @@ on a ~190-frame request (1962 vs 2428 ms total generate).
 
 Adds a [loop wall / host tail] diagnostic under QWEN3_TTS_TIMING.
 
-Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 
 ```
  CMakeLists.txt                |  11 +
@@ -490,10 +459,7 @@ truncate the babble afterwards.
 
 Clients that know how long their text should take can now send
 max_audio_tokens; it is clamped to [1, --max-tokens] so a request can
-never raise the server cap. TTS-Player sends 12.5 * (2.5 + 0.12 * chars).
-
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01RtJ5M45ohEiBC4QTAZ6krm
+never raise the server cap. The queue sends 12.5 * (2.5 + 0.12 * chars).
 
 ```
  src/server.cpp | 9 ++++++++-
@@ -575,11 +541,8 @@ Live investigation of "10 s GPU pegs + runaway audio" under contention.
 
 Measured with llama-server + embedding-server at 99% GPU: 4 blocks/CU
 timed out on every request (~220 ms/frame); 1 block/CU had zero
-timeouts, 14.7 ms/frame fused. The service now runs 1/CU (TTS-Player
+timeouts, 14.7 ms/frame fused. The service now runs 1/CU (the queue's old
 tts-engine.service). docs/talker_fusion_handoff.md has the write-up.
-
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01RtJ5M45ohEiBC4QTAZ6krm
 
 ```
  docs/talker_fusion_handoff.md | 53 +++++++++++++++++++++++++++++++++++++++++++
@@ -595,9 +558,6 @@ Claude-Session: https://claude.ai/code/session_01RtJ5M45ohEiBC4QTAZ6krm
 Results log brought up to date (1.85x -> 0.12x); goal marked met. Eight
 proposals with expected gain and gate for each, plus what is explicitly
 not proposed. Nothing started.
-
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01RtJ5M45ohEiBC4QTAZ6krm
 
 ```
  docs/performance_plan.md      | 83 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++--

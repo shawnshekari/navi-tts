@@ -88,7 +88,7 @@ TOKENIZER_CASES = [
     # special-token-like text that is not an added token, and the real ones mid-text
     "<|im_start|> <|notatoken|> <tool_call>x</tool_call> <|endoftext|><|im_end|>",
     "assistant\n", "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n",
-    # the TTS-Player queue's typical outputs
+    # the household TTS queue's typical outputs
     "Build finished: 3 warnings, 0 errors. Running tests...",
     "Ok — I've updated tts_queue.py (lines 42–58) and restarted the service.",
     "Yes.", "No", "", " ",

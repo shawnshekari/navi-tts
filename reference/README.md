@@ -1,7 +1,7 @@
 # reference/
 
-Verbatim copies of the author's own work from the frozen fork at
-`~/tools/qwen3-tts.cpp` (see `HISTORY.md`). Nothing here is built; it is the
+Verbatim copies of the author's own work from the frozen fork
+(see `HISTORY.md`). Nothing here is built; it is the
 starting material for `model/qwen3tts/` and `runtime/bench/`.
 
 - `hip/` - the fused cooperative talker, code predictor and frame kernels

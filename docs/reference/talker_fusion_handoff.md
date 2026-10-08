@@ -102,7 +102,7 @@ Gate-1 build, fused talker + fused cp, temp 0.9 / top-k 50, both voices
 
 **Pin coupling — apply at the Gate 3 cutover, not before.** The seed is
 path-dependent: seed 2 is only auditioned against the fused-talker
-arithmetic. The live client pin is `~/src/TTS-Player/tts_config.yaml`
+arithmetic. The live client pin is the queue's `tts_config.yaml`
 (`voices.seeds`, hot-reloaded; voice_1=nyx, voice_2=amy, currently 42
 = the ggml-talker roll). Changing it now would re-roll the live voice
 onto an unauditioned seed on the *old* path. At cutover, change both
@@ -172,7 +172,7 @@ generator, the default 4/CU (192-block) grids hit the barrier deadline on
 every run**, fused path intact at 14.7 ms/frame under full load (RTF ~0.18),
 12.8 ms/frame through the live queue. On a quiet GPU 1/CU is also slightly
 faster (9.0 vs 9.5 ms/frame) with bit-identical output. The service unit
-now sets it (TTS-Player `tts-engine.service`). The self-heal latch remains
+now sets it (the queue's old `tts-engine.service`). The self-heal latch remains
 as the safety net; it should rarely fire now.
 
 **2. Mid-request fused-cp -> GGML fallback used a stale hidden (runaway root cause).**

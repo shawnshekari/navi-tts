@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-time import into the persistent voice store (DESIGN 3.2): TTS-Player's
+# One-time import into the persistent voice store (DESIGN 3.2): the queue's
 # two hand-made voices under the ids the queue uses, and every Skyrim voice
 # type the retired shim had cached. Offline - the server need not run; a
 # re-run with unchanged samples is a no-op.
@@ -13,7 +13,7 @@ export LD_LIBRARY_PATH="$HOME/tools/therock-tarball/install/lib:$HOME/tools/ther
 
 add() { "$NAVI" voices --voices "$VOICES" add --model "$MODEL" --name "$1" --voice "$2"; }
 
-TP="$HOME/src/TTS-Player/voices"
+TP="${TTS_QUEUE_VOICES:?set TTS_QUEUE_VOICES to the queue voices dir}"
 [ -f "$TP/nyx_reference.wav" ] && add voice_1 "$TP/nyx_reference.wav"
 [ -f "$TP/amy_reference.wav" ] && add voice_2 "$TP/amy_reference.wav"
 

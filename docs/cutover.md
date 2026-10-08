@@ -24,11 +24,11 @@ on 2026-09-19 with the cleanup below - there are no units left to conflict with.
 ## Sequence
 
 1. `deploy/import_voices.sh` - fills the store offline: `voice_1`, `voice_2`
-   from TTS-Player, the Skyrim voice types from the shim's cache. Safe to run
+   from the queue, the Skyrim voice types from the shim's cache. Safe to run
    while the old engine serves; re-runs are no-ops.
 2. `cp deploy/navi-tts.service deploy/navi-tts-metrics-textfile.service
    ~/.config/systemd/user/ && systemctl --user daemon-reload`
-3. TTS-Player: `tts-queue.service` depends on `navi-tts.service`; the Makefile's
+3. The queue repo: `tts-queue.service` depends on `navi-tts.service`; the Makefile's
    `start`/`stop`/`status`/`install` name `navi-tts tts-queue`; `tts-toggle`
    follows the Makefile. Install the unit, `daemon-reload`.
 4. `systemctl --user stop tts-queue skyrimnet-xtts-shim tts-register-voices tts-engine`
@@ -43,15 +43,15 @@ on 2026-09-19 with the cleanup below - there are no units left to conflict with.
 
 The three retired units were removed from `~/.config/systemd/user` once navi-tts
 had been live for two days. All three were already `disabled` and `inactive`;
-nothing outside prose referenced them (`tts-toggle` -> TTS-Player's Makefile ->
+nothing outside prose referenced them (`tts-toggle` -> the queue's Makefile ->
 `navi-tts tts-queue`, and `tts-queue.service` already `Requires=navi-tts.service`).
 Each was archived beside its source first:
 
 | Unit | Archived to |
 |---|---|
-| `tts-engine.service` | `~/tools/qwen3-tts.cpp/tts-engine.service` |
-| `skyrimnet-xtts-shim.service` | `~/src/TTS-Player/integrations/skyrimnet/` (copy already there) |
-| `tts-register-voices.service` | `~/src/TTS-Player/tts-register-voices.service` |
+| `tts-engine.service` | archived in the upstream fork's repo |
+| `skyrimnet-xtts-shim.service` | archived in the queue's repo (integrations/skyrimnet/) |
+| `tts-register-voices.service` | archived in the queue's repo |
 
 Each archived copy carries a `# RETIRED` header saying where it ran and why it
 stopped. Six stale `*.service.*.bak` / `.pre-metrics` files (embedding-server,

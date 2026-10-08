@@ -66,7 +66,7 @@ model family is a second `model/` module (section 5), not a rewrite of the runti
 ## 3. Contract
 
 Everything above the engine keeps working unchanged when the binary is swapped:
-TTS-Player's queue, the Claude Code / opencode cues, SkyrimNet, and any direct
+The household TTS queue, the Claude Code / opencode cues, SkyrimNet, and any direct
 client (SillyTavern, Open-LLM-VTuber).
 
 ### 3.1 HTTP, `127.0.0.1:8080`
@@ -206,7 +206,7 @@ plugs in later; the engine reads whatever dtype the table says.
 
 `stream_format: "audio"` returns PCM as it is produced; TTFA target under 300 ms
 for a typical sentence (prefill + first batch + one vocoder batch). The queue in
-TTS-Player renders whole chunks today; it can move to streaming later without an
+The queue renders whole chunks today; it can move to streaming later without an
 engine change.
 
 ## 6. Correctness strategy
@@ -338,7 +338,7 @@ M0-M2 are the XTX. Nothing runs on the mini PC before M3.
 - **M2 — cutover.** Voice store with persistence, XTTS dialect, streaming,
   `/metrics`, warm-up, runaway/contention tests green for a day. `navi-tts.service`
   replaces `tts-engine.service`; `skyrimnet-xtts-shim.service` and
-  `tts-register-voices.service` retired; TTS-Player docs updated.
+  `tts-register-voices.service` retired; queue docs updated.
   **Cut over 2026-09-17** (`docs/cutover.md`); the day's soak is the open item.
   A first tuning pass followed the same evening (`docs/tuning.md`).
 - **M3 — Strix Halo.** Fat binary, build and bench on the mini PC, tune grid/

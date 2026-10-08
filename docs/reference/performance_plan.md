@@ -181,7 +181,7 @@ loop, which changes what is worth doing. For a typical 4 s chunk: loop ~425 ms
 - Not perf; observability. Context: the household now has Prometheus + Grafana
   on the mini PC (the halogen monitoring stack), already scraping every
   llama-server and halogen. The TTS queue will export its own view
-  (`TTS-Player/README.md`, "Metrics"), but SillyTavern, OpenVtuber and other
+  (the queue's README, "Metrics"), but SillyTavern, OpenVtuber and other
   clients hit this server **directly**, so the queue's numbers are a subset —
   the engine has to count its own.
 - [ ] `GET /metrics` in `server.cpp`, llama.cpp's shape and naming so the
