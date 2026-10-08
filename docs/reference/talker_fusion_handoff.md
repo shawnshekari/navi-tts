@@ -134,7 +134,7 @@ ms best/mean, 15/15 argmax). Unit rewritten: `ExecStart` →
 process`/pkill lines dropped, `Before=llama-server` VRAM ordering kept,
 fused flags via `Environment=`. **Gotcha hit during cutover:** systemd
 doesn't source `~/.bashrc`, so the therock libs weren't on the path —
-the unit now sets `LD_LIBRARY_PATH=/home/sreed/tools/therock-tarball/
+the unit now sets `LD_LIBRARY_PATH=~/tools/therock-tarball/
 install/lib:.../llvm/lib` explicitly (the ld cache only has the old
 system `libamdhip64.so.5`). Client seed pins flipped 42→2 with the
 restart (Gate 2 keeper).
@@ -498,8 +498,8 @@ it, so there is a single source of truth for the barrier).
 # configure (host therock ROCm; use clang++ directly, NOT the hipcc wrapper)
 cmake -S . -B build-hip-host -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1100 \
       -DQWEN3_TTS_TIMING=ON -DCMAKE_BUILD_TYPE=Release \
-      -DCMAKE_HIP_COMPILER=/home/sreed/tools/therock-tarball/install/lib/llvm/bin/clang++ \
-      -DCMAKE_PREFIX_PATH=/home/sreed/tools/therock-tarball/install
+      -DCMAKE_HIP_COMPILER=~/tools/therock-tarball/install/lib/llvm/bin/clang++ \
+      -DCMAKE_PREFIX_PATH=~/tools/therock-tarball/install
 cmake --build build-hip-host -j8
 
 # reference dump (first decode step: step_embd, hidden, logits, full KV cache)

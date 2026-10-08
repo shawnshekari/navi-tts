@@ -13,7 +13,7 @@ Before=llama-server.service embedding-server.service
 Type=simple
 # Host therock ROCm libs: the ld cache only carries the old system libamdhip64;
 # systemd does not source ~/.bashrc.
-Environment=LD_LIBRARY_PATH=/home/sreed/tools/therock-tarball/install/lib:/home/sreed/tools/therock-tarball/install/llvm/lib
+Environment=LD_LIBRARY_PATH=%h/tools/therock-tarball/install/lib:%h/tools/therock-tarball/install/llvm/lib
 # Navi 31 has 4 HW compute queues; llama-server and embedding-server cap at 1
 # each. Without a matching cap the old engine oversubscribed the rest under
 # heavy concurrent load (2026-09-12: amdgpu page faults, a stuck queue).
