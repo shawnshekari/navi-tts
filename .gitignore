@@ -4,3 +4,4 @@ build*/
 tools/.venv/
 __pycache__/
 *.tmp
+.claude/
