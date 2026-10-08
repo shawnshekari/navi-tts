@@ -77,6 +77,13 @@ the weight file.
   --xtts-port 8020 --max-frames 600` with the voices dir above, which holds the
   cloned voices plus the Skyrim voice pack the queue exposes by name.
 
+## License
+
+The code in this repository is AGPL-3.0-only (`LICENSE`). Model weights are not
+part of it: the Hugging Face `Qwen3-TTS-12Hz-0.6B-Base` artifacts and the
+`.navi` blobs converted from them are separate works under the Qwen Community
+License 1.0 (`models/README.md`).
+
 ## Lineage
 
 Written from scratch. The Qwen3-TTS model was first brought to GGML by

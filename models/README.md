@@ -10,3 +10,6 @@ Weights live here; everything except this file is git-ignored (multi-GB).
 - `*.navi` - converted blobs the engine loads, produced by `tools/convert.py`.
 
 Re-fetch with `huggingface-cli download Qwen/Qwen3-TTS-12Hz-0.6B-Base` if lost.
+
+Weights here (and the `.navi` blobs converted from them) are governed by the
+Qwen Community License 1.0, not by the repository's AGPL-3.0 code license.
