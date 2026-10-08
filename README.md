@@ -107,7 +107,9 @@ the weight file.
   --xtts-port 8020 --max-frames 600` with the voices dir, which holds the
   cloned voices plus the Skyrim voice pack the queue exposes by name.
 - Unit files for the service and the Prometheus textfile exporter, plus the
-  one-time voice import script, are in `deploy/`.
+  one-time voice import script, are in `deploy/` - see `deploy/README.md`
+  for install steps and for the ordering/environment lines that are
+  load-bearing on a shared card.
 
 ## License
 
