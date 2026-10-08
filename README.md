@@ -78,9 +78,13 @@ one directory per voice named after the registered name, and load at start;
 replaces. Reference audio at any rate is resampled to 24 kHz. Offline, without
 the server:
 
-    ./build/xtx/navi-tts voices add --model models/qwen3-tts-0.6b-f16.navi --name voice_1 --voice nyx.wav
+    ./build/xtx/navi-tts voices add --model models/qwen3-tts-0.6b-f16.navi --name voice_1 --voice voices/voice_1.wav
     ./build/xtx/navi-tts voices list
     ./build/xtx/navi-tts voices rm voice_1
+
+`voices/voice_1.wav` is a bundled 10 s reference clip so the example - and
+the `voice_1` numbers in the table up top - work out of the box; anything
+clean and spoken works the same way (`docs/reference/custom_voice_setup.md`).
 
 Weights are converted once, offline:
 
@@ -116,7 +120,9 @@ the weight file.
 The code in this repository is AGPL-3.0-only (`LICENSE`). Model weights are not
 part of it: the Hugging Face `Qwen3-TTS-12Hz-0.6B-Base` artifacts and the
 `.navi` blobs converted from them are separate works under the Qwen Community
-License 1.0 (`models/README.md`).
+License 1.0 (`models/README.md`). The bundled reference clip
+`voices/voice_1.wav` is CC-BY-4.0 (Shawn Reed) - use it to clone, remix or
+replace freely.
 
 ## Lineage
 

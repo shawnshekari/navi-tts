@@ -13,9 +13,15 @@ export LD_LIBRARY_PATH="$HOME/tools/therock-tarball/install/lib:$HOME/tools/ther
 
 add() { "$NAVI" voices --voices "$VOICES" add --model "$MODEL" --name "$1" --voice "$2"; }
 
-TP="${TTS_QUEUE_VOICES:?set TTS_QUEUE_VOICES to the queue voices dir}"
-[ -f "$TP/nyx_reference.wav" ] && add voice_1 "$TP/nyx_reference.wav"
-[ -f "$TP/amy_reference.wav" ] && add voice_2 "$TP/amy_reference.wav"
+TP="${TTS_QUEUE_VOICES:-}"
+if [ -n "$TP" ] && [ -f "$TP/nyx_reference.wav" ]; then
+  add voice_1 "$TP/nyx_reference.wav"
+else
+  add voice_1 "$HERE/../voices/voice_1.wav"   # bundled reference clip
+fi
+if [ -n "$TP" ] && [ -f "$TP/amy_reference.wav" ]; then
+  add voice_2 "$TP/amy_reference.wav"
+fi
 
 SHIM="$HOME/.cache/skyrimnet-xtts-shim/samples"
 if [ -d "$SHIM" ]; then

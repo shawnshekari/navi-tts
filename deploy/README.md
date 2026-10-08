@@ -37,11 +37,11 @@ Things in the unit that are load-bearing - read before trimming:
 For a headless box, keep the unit alive across logout: `loginctl
 enable-linger $USER`.
 
-Voice migration from the old fork-era engine is one-time and offline:
-`TTS_QUEUE_VOICES=<queue repo's voices dir> deploy/import_voices.sh` - it
-takes the two cloned references from the queue repo (on disk, not in this
-repo) and, if present, the Skyrim samples cached under
-`~/.cache/skyrimnet-xtts-shim/samples`.
+A fresh install can populate the store with the bundled clip:
+`deploy/import_voices.sh` registers `voice_1` from `voices/voice_1.wav`
+plus any Skyrim samples cached under `~/.cache/skyrimnet-xtts-shim/samples`.
+Migrating from the old fork-era engine instead, point it at the queue repo's
+clips first: `TTS_QUEUE_VOICES=<queue voices dir> deploy/import_voices.sh`.
 
 ## navi-tts-metrics-textfile.service (optional, needs Prometheus)
 
