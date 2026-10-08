@@ -179,7 +179,7 @@ loop, which changes what is worth doing. For a typical 4 s chunk: loop ~425 ms
 
 ### Task 4.9: Native `/metrics` (Prometheus) on the engine — TO BE DISCUSSED (added 2026-09-14)
 - Not perf; observability. Context: the household now has Prometheus + Grafana
-  on minipc (`/home/sreed/src/halogen/monitoring/`), already scraping every
+  on the mini PC (the halogen monitoring stack), already scraping every
   llama-server and halogen. The TTS queue will export its own view
   (`TTS-Player/README.md`, "Metrics"), but SillyTavern, OpenVtuber and other
   clients hit this server **directly**, so the queue's numbers are a subset —
@@ -203,7 +203,7 @@ loop, which changes what is worth doing. For a typical 4 s chunk: loop ~425 ms
   let the workstation's node_exporter textfile writer copy
   `http://127.0.0.1:8080/metrics` verbatim into `tts_engine.prom` every 5 s
   (the format passes straight through the textfile collector), so Prometheus
-  on minipc sees it without the engine ever being LAN-exposed. Same pattern as
+  on the mini PC sees it without the engine ever being LAN-exposed. Same pattern as
   the amdgpu and llama-server `/slots` collectors already running there.
 - Why it earns a place in a *performance* plan: Task 4.1/4.2/4.3 all change
   latency in ways that are currently checked with one-off runs. A permanent

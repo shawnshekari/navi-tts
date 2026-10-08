@@ -13,7 +13,7 @@ Copied from ~/.local/share/rocm-clangrt-overlay/README:
 
 ## Strix Halo mini PC (M3, 2026-09-18)
 
-`sreed@minipc`: Fedora 43, Ryzen AI MAX+ 395 (gfx1151, 20 WGPs), 124 GB unified.
+The Strix mini PC: Fedora 43, Ryzen AI MAX+ 395 (gfx1151, 20 WGPs), 124 GB unified.
 ROCm is the therock gfx1151 tarball extracted to `~/tools/therock-tarball/install`
 (same layout as the workstation, so the presets' compiler path holds); cmake and
 ninja are `uv tool install cmake ninja` (user-space, `~/.local/bin`).
