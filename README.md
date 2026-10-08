@@ -22,6 +22,46 @@ as VRAM on the XTX (2.67 GiB, GTT negligible), and as GTT - shared system RAM -
 on Strix Halo (2.68 GiB, the APU's carve-out VRAM stays at ~10 MiB). Cloned
 voices in the voices dir add only their reference embeddings (~KB each).
 
+## Features
+
+- **HIP only, down to the bone.** One binary, hand-written kernels, no framework
+  underneath and no CPU/Vulkan/CUDA fallback anywhere. A failed kernel fails the
+  request cleanly; it never silently degrades.
+- **Tuned for batch-one, bandwidth-bound decode.** One persistent cooperative
+  kernel per 12 Hz frame; the numbers up top are what production serves.
+- **Voice cloning that survives restarts.** Register over HTTP
+  (`POST /v1/audio/voices`) or offline (`navi-tts voices add`); reference
+  audio at any sample rate is resampled to 24 kHz and stored as a portable
+  directory that moves between hosts by copying it.
+- **Streaming.** `/v1/audio/speech` with `stream_format: "audio"` (chunked WAV
+  or, with `response_format: "pcm"`, raw s16le) or `"sse"` (base64 PCM events,
+  then `speech.audio.done` with the timings); first chunk 4 frames, ~70 ms to
+  first audio, then `stream_batch_size` (default 16). Batching never changes
+  the PCM.
+- **The machine stays alive.** Cooperative kernels carry spin caps and an abort
+  flag; every request gets a frame budget (`max_audio_tokens`) plus a
+  post-render runaway guard.
+- **Observable.** `GET /metrics` serves Prometheus text (`tts:` counters per
+  stage, TTFA and RTF histograms, `_last` gauges).
+- **Measured, not vibes.** `ctest` parity gates check token ids, hidden states,
+  logits, codes and PCM against reference dumps from the PyTorch model; the
+  same text + seed is a bit-exact WAV.
+
+## Requirements
+
+- **GPU:** gfx1100 (RX 7900 series) or gfx1151 (Strix Halo). Other hardware is
+  out of scope by design - the kernels target these and there is no fallback.
+- **ROCm >= 10.1**, installed rootless into one directory from a TheRock
+  release tarball. CMake looks in `$ROCM_PATH`, then
+  `~/tools/therock-tarball/install`.
+- **CMake >= 3.28 + Ninja.** The ROCm clang compiles host *and* device code -
+  no `hipcc` wrapper, no system g++ (`docs/reference/toolchain.md` covers
+  distro quirks).
+- **Model weights, separately licensed:** `Qwen/Qwen3-TTS-12Hz-0.6B-Base` on
+  Hugging Face (gated; accept the Qwen license to download). See
+  `models/README.md`.
+- **Python + `uv`**, for `tools/` only (the converter and reference dumps).
+
 ## Build (workstation; `--preset strix` on the mini PC, see `docs/reference/toolchain.md`)
 
     cmake --preset xtx && cmake --build --preset xtx
@@ -42,9 +82,7 @@ the server:
     ./build/xtx/navi-tts voices list
     ./build/xtx/navi-tts voices rm voice_1
 
-The preset picks the ROCm clang from `~/tools/therock-tarball/install` for
-host and device code; no `hipcc`, no system compiler. Weights are converted
-once, offline:
+Weights are converted once, offline:
 
     cd tools && uv sync && uv run convert.py ../models/Qwen3-TTS-12Hz-0.6B-Base ../models/qwen3-tts-0.6b-f16.navi
 
@@ -54,28 +92,22 @@ the vocoder time, not audible - DESIGN 6.)
 `docs/DESIGN.md` is the design, `docs/model.md` the model, `docs/navi-format.md`
 the weight file.
 
-## Scope
+## Deployment
 
-- **Model:** Qwen3-TTS architecture (0.6B), own weight format converted offline.
-  Fine-tunes of the same architecture are just different weights.
 - **Bind:** `--host` defaults to `127.0.0.1`; the production unit passes
   `0.0.0.0` to serve the LAN (no auth on any endpoint - LAN-trusted, same
   tradeoff as the household TTS queue's daemon).
-- **API:** OpenAI-compatible `/v1/audio/speech` and `/v1/audio/voices` on `:8080`,
-  plus the XTTS dialect SkyrimNet speaks (`/create_and_store_latents`,
-  `/tts_to_audio/`, `/speakers`, ...) on the same port and, with
-  `--xtts-port 8020`, on the port SkyrimNet's `XTTS.yaml` already names.
-  Cloned voices persist across restarts. `/v1/audio/speech` streams with
-  `stream_format: "audio"` (chunked WAV or, with `response_format: "pcm"`, raw
-  s16le) or `"sse"` (base64 PCM events, then `speech.audio.done` with the
-  timings); the first chunk is 4 frames (~70 ms to first audio), then
-  `stream_batch_size` (default 16). Batching never changes the PCM.
-  `GET /metrics` is Prometheus text (`tts:` counters per stage, TTFA and RTF
-  histograms, `_last` gauges) for the node_exporter textfile collector.
+- **API dialects:** OpenAI-compatible `/v1/audio/speech` and `/v1/audio/voices`
+  on `:8080`, plus the XTTS dialect SkyrimNet speaks
+  (`/create_and_store_latents`, `/tts_to_audio/`, `/speakers`, ...) on the same
+  port and, with `--xtts-port 8020`, on the port SkyrimNet's `XTTS.yaml`
+  already names.
 - **Serves:** the household TTS queue (Claude Code / opencode cues) and SkyrimNet.
   Production is the `navi-tts.service` user unit: `serve --host 0.0.0.0 --port 8080
-  --xtts-port 8020 --max-frames 600` with the voices dir above, which holds the
+  --xtts-port 8020 --max-frames 600` with the voices dir, which holds the
   cloned voices plus the Skyrim voice pack the queue exposes by name.
+- Unit files for the service and the Prometheus textfile exporter, plus the
+  one-time voice import script, are in `deploy/`.
 
 ## License
 
