@@ -22,7 +22,7 @@
 // T <= 32, no intrinsics, for 10 % less than quad.
 // Build (from bench/micro):
 //   clang++ -x hip --offload-arch=gfx1100 --rocm-path=$ROCM -O3 -I../.. gemm_skinny.hip -o gemm_skinny -L$ROCM/lib -lamdhip64
-// Run it briefly, the card is shared (CLAUDE.md).
+// Run it briefly, the card is shared.
 #include "model/qwen3tts/kernels.h"
 #include <hip/hip_runtime.h>
 #include <cstdio>

@@ -96,7 +96,7 @@ int main(int argc, char ** argv) {
                     a == b ? "bit-identical" : "DIFFERENT", c.size() / 16, a == c ? "identical to seed 2 (!)" : "differs");
         const bool det_ok = a == b && a != c && !a.empty();
 
-        // The barrier's deadline (CLAUDE.md: a cooperative kernel must never be able
+        // The barrier's deadline (a cooperative kernel must never be able
         // to hang the box): with a spin cap far below a frame's ~700 barriers' worth
         // of waiting, the frame must come back as a failure, promptly, and a normal
         // Frame must still work afterwards.

@@ -3,7 +3,7 @@
 // variants of rows per wave / loads in flight / block size. Streams a 500 MB
 // rotation so the 96 MB Infinity Cache does not flatter it. Build:
 //   clang++ -x hip --offload-arch=gfx1100 --rocm-path=$ROCM -O3 matvec.hip -o matvec -L$ROCM/lib -lamdhip64
-// Every barrier has a spin cap (CLAUDE.md); run it briefly, the card is shared.
+// Every barrier has a spin cap; run it briefly, the card is shared.
 // 2026-09-17, XTX: R4 U2 519-615 GB/s at the layer shapes, R2 U4 703-753 -> MV_ROWS 2 / unroll 4.
 // 2026-09-18, int8 weights (M4's question), block-32 f16 scales, u8 + folded
 // offset, timing only: at 256-thread blocks the convert per byte makes it

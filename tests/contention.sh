@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Contention test (DESIGN 2, CLAUDE.md): requests while tests/gpu_hog.hip
+# Contention test (DESIGN 2): requests while tests/gpu_hog.hip
 # fills every CU. A request must either complete (slower) or fail with a
 # clean engine_error inside the bound; the server must never hang and must
 # be back at normal RTF once the hog exits. Runs briefly, on purpose, against

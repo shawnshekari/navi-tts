@@ -1,4 +1,4 @@
-// The contention hog (CLAUDE.md): fills every CU for N seconds so the
+// The contention hog: fills every CU for N seconds so the
 // cooperative frame kernel has to fight for residency. Two modes:
 //   spin    resident blocks spinning on the wall clock (occupancy pressure)
 //   stream  the same grid streaming through a 1 GiB buffer (bandwidth

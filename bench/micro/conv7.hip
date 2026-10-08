@@ -7,7 +7,7 @@
 // kernel before it is timed (same per-output summation order: ci chunk, then
 // ci, then tap). Build:
 //   clang++ -x hip --offload-arch=gfx1100 --rocm-path=$ROCM -O3 -I../.. conv7.hip -o conv7 -L$ROCM/lib -lamdhip64
-// Run it briefly, the card is shared (CLAUDE.md).
+// Run it briefly, the card is shared.
 // 2026-09-18, XTX, per 16-frame chunk (all variants bit-exact with k_base):
 //   base 32x64 4x2 full unroll        9.4 ms   154 VGPRs; ws reads 16-way bank-conflicted
 //   + transposed ws, no unroll        7.7      the unroll alone was worth ~1 ms
