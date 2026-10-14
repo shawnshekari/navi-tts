@@ -11,6 +11,8 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace navi {
 
@@ -21,6 +23,11 @@ struct BenchOptions {
     std::uint64_t seed = 2;
     int repeats = 1;
     int warmup = 1;                                          // untimed utterances first (DESIGN 2)
+    // In-context cloning: the reference's transcript. With it the harness encodes voice_wav
+    // to reference codes and benches the ICL path, whose prompt is 10 + ref_frames rows
+    // instead of 10 - which costs prefill once AND adds that many keys to every frame's
+    // attention, so both are reported.
+    std::string ref_text;
     int vocoder_batch = 0;                                   // 0: the streaming configuration (STREAM_FIRST_BATCH, then STREAM_BATCH); N: N throughout
 };
 
@@ -35,8 +42,16 @@ struct BenchResult {
     // stages (M1+)
     std::optional<double> prefill_ms, frame_ms, talker_ms, cp_ms, vocoder_ms_per_frame, ttfa_ms, rtf;
     std::optional<int> n_frames;
+    // in-context cloning
+    bool icl = false;
+    std::optional<int> prefill_rows, ref_frames;
+    // Per-position frame times, for comparing the two conditioning modes without the
+    // confound of utterances of different lengths. A position the run never reached is
+    // absent, not zero.
+    std::vector<std::pair<int, double>> frame_ms_at;
     std::optional<std::string> wav_sha256;
     std::string text;
+    std::string voice;          // the reference WAV's basename: a run with another voice is another measurement
     std::uint64_t seed = 0;
 
     std::string to_json() const;

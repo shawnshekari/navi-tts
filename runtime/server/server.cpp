@@ -328,13 +328,17 @@ private:
         return ids.empty() ? nullptr : store_.find(ids.front());
     }
 
-    // Clone `sample` under `name`: same name + same bytes is a no-op, a new
-    // sample under an existing name replaces it. Runs the encoder on the worker.
+    // Clone `sample` under `name`: a no-op only if the stored voice already is what this
+    // clone would produce - same bytes, same transcript, and the same in-context state, so
+    // a voice registered before its transcript was known gains ICL when re-registered with
+    // one. A new sample under an existing name replaces it. Runs on the worker.
     struct CloneResult { voices::VoicePtr voice; const char * status; };
     CloneResult clone(const std::string & name, std::span<const std::uint8_t> sample, const std::string & ref_text) {
         const std::string id = voices::Store::id_for(name);
         const std::string sha = voices::Store::sha256_hex(sample);
-        if (auto v = store_.find(id); v && v->sample_sha256 == sha) return {v, "exists"};
+        if (store_.current(id, sha, ref_text, graph_.has_codec_encoder())) {
+            return {store_.find(id), "exists"};
+        }
         const auto wav = audio::to_rate(audio::parse_wav(sample), params_.spk_sample_rate);
         if (wav.pcm.size() < static_cast<std::size_t>(params_.spk_sample_rate) / 2) throw std::invalid_argument("reference audio is shorter than 0.5 s");
         voices::Voice v;
@@ -346,12 +350,28 @@ private:
         v.sample_seconds = static_cast<double>(wav.pcm.size()) / wav.sample_rate;
         const bool replaced = store_.find(id) != nullptr;
         const auto t0 = std::chrono::steady_clock::now();
-        worker_.run([&] { v.embedding = graph_.embed_speaker(wav.pcm); });
+        const bool want_codes = !ref_text.empty() && graph_.has_codec_encoder();
+        worker_.run([&] {
+            v.embedding = graph_.embed_speaker(wav.pcm);
+            // In-context cloning needs the reference's codes; without a transcript or a
+            // codec encoder the voice stays embedding-only, which is what it was before.
+            if (want_codes) v.ref_codes = graph_.encode_reference(wav.pcm, &v.ref_frames);
+        });
+        if (!want_codes && !ref_text.empty()) {
+            // Codes depend on the audio alone: an unchanged sample keeps the ones it has
+            // rather than losing them to a model that cannot make new ones.
+            v.ref_codes = store_.codes_for_sample(id, sha, &v.ref_frames);
+        }
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         metrics_.clones_total++;
         Metrics::add(metrics_.clone_seconds_total, ms / 1e3);
         auto ptr = store_.put(std::move(v), sample);
-        if (opt_.verbose) std::fprintf(stderr, "voice %s%s: %.1f s of audio, %.0f ms\n", id.c_str(), replaced ? " (replaced)" : "", ptr->sample_seconds, ms);
+        if (opt_.verbose) {
+            std::fprintf(stderr, "voice %s%s: %.1f s of audio, %.0f ms, %s\n", id.c_str(),
+                         replaced ? " (replaced)" : "", ptr->sample_seconds, ms,
+                         ptr->icl() ? ("in-context (" + std::to_string(ptr->ref_frames) + " frames)").c_str()
+                                    : "embedding-only");
+        }
         return {ptr, replaced ? "replaced" : "created"};
     }
 
@@ -385,6 +405,13 @@ private:
             return false;
         }
         sp.sr.speaker = sp.voice->embedding;
+        // A voice with both halves of a reference is served in-context; one without them is
+        // served exactly as before. The voice is held for the request, so the spans stay valid.
+        if (sp.voice->icl()) {
+            sp.sr.ref_text = sp.voice->ref_text;
+            sp.sr.ref_codes = sp.voice->ref_codes;
+            sp.sr.ref_frames = sp.voice->ref_frames;
+        }
         sp.sr.max_frames = opt_.max_audio_tokens;
         sp.sr.sampling.temperature = params_.temperature;
         sp.sr.sampling.top_k = params_.top_k;

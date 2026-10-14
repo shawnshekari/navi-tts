@@ -1,0 +1,67 @@
+{
+ "model": "Qwen3-TTS-12Hz-1.7B-Base",
+ "model_config_sha256": "b4f01752d15a488abde3e1ab44723ae4f4b9e68a4037257b098b3737893cc1f9",
+ "safetensors_sha256": "38fc7fc51c5e776e840414b6fd443962e9411b9654888fd7913e4da643cb857c",
+ "codec_safetensors_sha256": "836b7b357f5ea43e889936a3709af68dfe3751881acefe4ecf0dbd30ba571258",
+ "text": "The quick brown fox jumps over the lazy dog, and the bench text stays fixed.",
+ "language": "english",
+ "voice_wav": "voice_1.wav",
+ "voice_wav_sha256": "bac57946c356d1d2614d6d9b41c72dfc5934db965365e39463ac03a258aec38d",
+ "voice_samples": 360000,
+ "sample_rate": 24000,
+ "prompt_text": "<|im_start|>assistant\nThe quick brown fox jumps over the lazy dog, and the bench text stays fixed.<|im_end|>\n<|im_start|>assistant\n",
+ "n_text_ids": 25,
+ "prefill_len": 10,
+ "trailing_len": 17,
+ "talker_hidden": 2048,
+ "cp_hidden": 1024,
+ "cp_projection": "Linear",
+ "greedy_frames": 31,
+ "sampled_frames": 83,
+ "sampled_samples": 159360,
+ "sampled_seed": 2,
+ "suppress_tokens": [
+  2048,
+  3071,
+  "range, minus codec_eos"
+ ],
+ "greedy": {
+  "do_sample": false,
+  "subtalker_dosample": false,
+  "repetition_penalty": 1.05,
+  "max_new_tokens": 32,
+  "min_new_tokens": 2,
+  "non_streaming_mode": false,
+  "audio": "NOT SPEECH. Argmax decoding of this model collapses into a loop of silence codes after ~10 frames and never emits EOS (with or without the repetition penalty). Compare greedy_codes code-for-code; never decode it, never listen to it. The audible reference is the sampled run."
+ },
+ "sampled": {
+  "note": "model.generate defaults (generation_config.json), torch.manual_seed(sampled_seed)",
+  "max_new_tokens": 400
+ },
+ "dtype": "float32",
+ "device": "cpu",
+ "torch": "2.14.1+cpu",
+ "transformers": "4.57.3",
+ "qwen_tts": "0.1.1",
+ "python": "3.13.9",
+ "numpy": "2.5.3",
+ "ref_frames": 188,
+ "ref_conv_rows": 375,
+ "ref_codes_f16w_diff": 38,
+ "ref_codes_f16w_note": "documentation, not a gate: f16 encoder weights move the ICL prefill hidden by 1.3e-2 rel-rms, so the engine stores the encoder f32 while the decoder stays f16 (DESIGN 6)",
+ "icl_ref_text": "This is the reference recording used by the parity dumps.",
+ "icl_ref_text_note": "a FIXED STRING, not a transcription of the reference audio: no transcript exists for it. Parity does not depend on it being true. Nothing in the icl_* set is a listen reference.",
+ "icl_n_ref_text_ids": 16,
+ "icl": {
+  "ref_frames": 188,
+  "prefill_len": 198,
+  "trailing_len": 1,
+  "greedy_frames": 31,
+  "sampled_frames": 14
+ },
+ "icl_short": {
+  "ref_frames": 8,
+  "prefill_len": 18,
+  "trailing_len": 20
+ }
+}

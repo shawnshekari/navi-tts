@@ -40,11 +40,15 @@ namespace navi::qwen3tts::kern {
 //
 // The per-output summation order is chunk, then channel, then tap, in every
 // path - the kernel is bit-exact with its previous form.
+//
+// PRO is applied as rows are staged, so it covers history rows too and the history
+// buffers hold pre-activation values. PRO_ELU is the codec encoder's activation
+// (exp(x) - 1 below zero, alpha = 1, as nn.ELU defaults).
 // ---------------------------------------------------------------------------
 
 constexpr int TT = 32, CT = 64, CC = 16, NTHREADS = 256, MAX_DIL = 9;
 
-enum Pro { PRO_NONE = 0, PRO_SNAKE = 1, PRO_SILU_GATE = 2, PRO_ADD2 = 3 };
+enum Pro { PRO_NONE = 0, PRO_SNAKE = 1, PRO_SILU_GATE = 2, PRO_ADD2 = 3, PRO_ELU = 4 };
 enum Epi { EPI_NONE = 0, EPI_GELU = 1, EPI_RESIDUAL = 2, EPI_SCALE_RESIDUAL = 3, EPI_CLAMP = 4, EPI_SILU = 5,
            EPI_RELU = 6, EPI_SIGMOID = 7, EPI_RELU_TANH = 8 };
 
@@ -124,6 +128,10 @@ __global__ void __launch_bounds__(NTHREADS) k_conv(ConvArgs a) {
                         const float s = __sinf(e[k] * a.snake_a[ci + k]);
                         e[k] += s * s * a.snake_b[ci + k];
                     }
+                } else if (PRO == PRO_ELU) {
+                    float * e = reinterpret_cast<float *>(&v);
+#pragma unroll
+                    for (int k = 0; k < 4; ++k) e[k] = e[k] > 0.f ? e[k] : __expf(e[k]) - 1.f;
                 }
                 *reinterpret_cast<float4 *>(&xs[r][c4]) = v;
             }
@@ -160,6 +168,8 @@ __global__ void __launch_bounds__(NTHREADS) k_conv(ConvArgs a) {
                     if (PRO == PRO_SNAKE) {
                         const float s = __sinf(v * a.snake_a[ci]);
                         v += s * s * a.snake_b[ci];
+                    } else if (PRO == PRO_ELU) {
+                        v = v > 0.f ? v : __expf(v) - 1.f;
                     }
                 }
                 xs[r][c] = v;

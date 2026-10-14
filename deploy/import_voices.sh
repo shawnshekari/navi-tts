@@ -3,6 +3,12 @@
 # two hand-made voices under the ids the queue uses, and every Skyrim voice
 # type the retired shim had cached. Offline - the server need not run; a
 # re-run with unchanged samples is a no-op.
+#
+# These are imported WITHOUT a transcript, so they clone by speaker embedding
+# only. In-context cloning needs the reference's exact words as well as its
+# audio (README, "In-context cloning"); a voice gains it by being re-added with
+# `--ref-text @file`, which is not a no-op precisely because the transcript
+# changed.
 #   usage: import_voices.sh [voices-dir]
 set -euo pipefail
 HERE="$(dirname "$(readlink -f "$0")")"

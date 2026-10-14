@@ -63,7 +63,32 @@ struct Params {
     int vocoder_sliding_window = 0;
     std::vector<int> vocoder_upsample_rates;    // [8, 5, 4, 3]
     std::vector<int> vocoder_upsampling_ratios; // [2, 2]
+
+    // Codec encoder (ICL cloning): present only in a blob converted with --with-encoder,
+    // which is what makes the reference codes a voice is conditioned on. Audio at
+    // `sample_rate` -> conv stack (strided, so 25 Hz) -> transformer -> stride-2 downsample
+    // (12.5 Hz) -> `n_valid_q` RVQ codes per frame. docs/model.md "Codec encoder".
     bool has_codec_encoder = false;
+    struct CodecEncoder {
+        int    latent = 0;              // hidden_size: the conv stack's output and the transformer's width
+        int    n_layer = 0, n_head = 0, head_dim = 0, ff = 0;
+        float  norm_eps = 0.f;          // LayerNorm WITH bias, not RMSNorm as everywhere else
+        double rope_theta = 0.0;
+        int    max_pos = 0;
+        float  layer_scale = 0.f;       // LayerScale on both residual branches
+        int    num_filters = 0;         // the conv stack's first width; it doubles at each ratio
+        int    kernel_size = 0, last_kernel_size = 0, residual_kernel_size = 0;
+        int    compress = 0;            // a residual unit's inner width is dim / compress
+        int    dilation_growth_rate = 0, num_residual_layers = 0;
+        std::vector<int> ratios;        // as stored, [8, 6, 5, 4]; the encoder walks them reversed
+        int    codebook_dim = 0, codebook_size = 0;
+        int    n_q = 0, n_semantic = 0; // the checkpoint's 32 quantizers, 1 of them semantic
+        int    n_valid_q = 0;           // how many the talker has embeddings for: 16
+        int    vq_dim = 0;              // vector_quantization_hidden_dimension, the argmin space
+        int    downsample_rate = 0;     // input samples per frame (1920)
+        int    sample_rate = 0;
+        std::string dtype;              // f32; tools/convert.py says why it is not the codec's dtype
+    } codec_encoder;
 
     // generation defaults
     float temperature = 1.f, top_p = 1.f, repetition_penalty = 1.f;

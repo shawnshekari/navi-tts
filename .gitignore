@@ -5,3 +5,5 @@ tools/.venv/
 __pycache__/
 *.tmp
 .claude/
+# generated audio: listen sets, A/B renders, anything a run writes for a human
+out/

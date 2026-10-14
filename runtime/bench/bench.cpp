@@ -88,8 +88,20 @@ std::string BenchResult::to_json() const {
     j.opt("ttfa_ms", ttfa_ms);
     j.opt("rtf", rtf);
     j.opt("n_frames", n_frames);
+    j.opt("prefill_rows", prefill_rows);
+    j.opt("ref_frames", ref_frames);
+    if (icl) j.str("clone_mode", "icl");
+    if (!frame_ms_at.empty()) {
+        j.ss << ",\"frame_ms_at\":{";
+        for (std::size_t i = 0; i < frame_ms_at.size(); ++i) {
+            if (i) j.ss << ',';
+            j.ss << '"' << frame_ms_at[i].first << "\":" << frame_ms_at[i].second;
+        }
+        j.ss << '}';
+    }
     j.opt("wav_sha256", wav_sha256);
     j.str("text", text);
+    j.str("voice", voice);
     j.u64("seed", seed);
     j.ss << '}';
     return j.ss.str();
@@ -107,6 +119,7 @@ BenchResult run_bench(const Device & dev, const BenchOptions & opt) {
     r.multiprocessors = dev.info().multiprocessors;
     r.text           = opt.text;
     r.seed           = opt.seed;
+    r.voice          = opt.voice_wav.substr(opt.voice_wav.find_last_of('/') + 1);
 
     const auto t0 = clock::now();
     NaviFile file = NaviFile::open(opt.model_path);
@@ -129,9 +142,21 @@ BenchResult run_bench(const Device & dev, const BenchOptions & opt) {
     // defaults, the reference voice, the fixed seed.
     const auto ref = audio::to_rate(audio::read_wav(opt.voice_wav), params.spk_sample_rate);
     const std::vector<float> speaker = graph->embed_speaker(ref.pcm);
+    std::vector<std::int32_t> ref_codes;
+    int ref_frames = 0;
+    if (!opt.ref_text.empty()) {
+        if (!graph->has_codec_encoder()) {
+            fail(opt.model_path + ": no codec encoder, so the ICL path cannot be benched "
+                 "(tools/convert.py --with-encoder)");
+        }
+        ref_codes = graph->encode_reference(ref.pcm, &ref_frames);
+    }
     qwen3tts::SynthRequest sr;
     sr.text = opt.text;
     sr.speaker = speaker;
+    sr.ref_text = opt.ref_text;
+    sr.ref_codes = ref_codes;
+    sr.ref_frames = ref_frames;
     sr.seed = opt.seed;
     sr.sampling.temperature = params.temperature;
     sr.sampling.top_k = params.top_k;
@@ -142,7 +167,17 @@ BenchResult run_bench(const Device & dev, const BenchOptions & opt) {
     sr.first_batch = opt.vocoder_batch > 0 ? opt.vocoder_batch : qwen3tts::STREAM_FIRST_BATCH;
     std::vector<float> pcm;
     for (int i = 0; i < opt.warmup; ++i) graph->synth(sr, pcm);
+    std::vector<double> frame_ms;
+    sr.frame_ms = &frame_ms;
     const qwen3tts::SynthStats st = graph->synth(sr, pcm);
+    r.icl = st.icl;
+    r.prefill_rows = st.prefill_rows;
+    if (st.icl) r.ref_frames = ref_frames;
+    for (const int at : {10, 50, 100, 200}) {
+        if (at < static_cast<int>(frame_ms.size())) {
+            r.frame_ms_at.emplace_back(at, frame_ms[static_cast<std::size_t>(at)]);
+        }
+    }
     r.prefill_ms = st.prefill_ms;
     r.n_frames = st.n_frames;
     r.frame_ms = st.n_frames ? st.frames_ms / st.n_frames : 0.0;

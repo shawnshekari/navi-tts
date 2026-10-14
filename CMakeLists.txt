@@ -107,7 +107,8 @@ add_library(navi_qwen3tts STATIC
     model/qwen3tts/tokenizer.cpp
     model/qwen3tts/graph.cpp
 )
-navi_hip_sources(navi_qwen3tts model/qwen3tts/vocoder.hip model/qwen3tts/talker.hip model/qwen3tts/frame.hip model/qwen3tts/speaker.hip)
+navi_hip_sources(navi_qwen3tts model/qwen3tts/vocoder.hip model/qwen3tts/talker.hip model/qwen3tts/frame.hip
+                 model/qwen3tts/speaker.hip model/qwen3tts/codec_encoder.hip)
 target_link_libraries(navi_qwen3tts PUBLIC navi_runtime)
 
 add_library(navi_server STATIC runtime/server/server.cpp)
@@ -123,22 +124,52 @@ target_link_libraries(navi-tts PRIVATE navi_server navi_qwen3tts navi_runtime)
 # --- tests -------------------------------------------------------------------
 # Parity gates against tests/reference (DESIGN 6). They need the converted model.
 set(NAVI_TEST_MODEL "${CMAKE_SOURCE_DIR}/models/qwen3-tts-0.6b-f16.navi" CACHE FILEPATH ".navi used by the tests")
+# The 1.7B runs the same five gates against its own dumps; it exercises the code
+# predictor's small_to_mtp_projection, which the 0.6B's equal widths skip. Both are
+# optional: a checkout with only one converted model still configures and tests.
+set(NAVI_TEST_MODEL_17B "${CMAKE_SOURCE_DIR}/models/qwen3-tts-1.7b-f16.navi" CACHE FILEPATH "1.7B .navi used by the tests")
+set(NAVI_TEST_REFERENCE_17B "${CMAKE_SOURCE_DIR}/tests/reference-1.7b" CACHE PATH "1.7B reference dumps")
 enable_testing()
 add_executable(test_tokenizer tests/test_tokenizer.cpp)
 target_link_libraries(test_tokenizer PRIVATE navi_qwen3tts navi_runtime)
-add_test(NAME tokenizer COMMAND test_tokenizer "${NAVI_TEST_MODEL}" "${CMAKE_SOURCE_DIR}/tests/reference/tokenizer_cases.json")
 add_executable(test_vocoder tests/test_vocoder.cpp)
 target_link_libraries(test_vocoder PRIVATE navi_qwen3tts navi_runtime)
-add_test(NAME vocoder COMMAND test_vocoder "${NAVI_TEST_MODEL}" "${CMAKE_SOURCE_DIR}/tests/reference" "${CMAKE_BINARY_DIR}/vocoder_out.wav")
 add_executable(test_prefill tests/test_prefill.cpp)
 target_link_libraries(test_prefill PRIVATE navi_qwen3tts navi_runtime)
-add_test(NAME prefill COMMAND test_prefill "${NAVI_TEST_MODEL}" "${CMAKE_SOURCE_DIR}/tests/reference")
 add_executable(test_frame tests/test_frame.cpp)
 target_link_libraries(test_frame PRIVATE navi_qwen3tts navi_runtime)
-add_test(NAME frame COMMAND test_frame "${NAVI_TEST_MODEL}" "${CMAKE_SOURCE_DIR}/tests/reference")
 add_executable(test_speaker tests/test_speaker.cpp)
 target_link_libraries(test_speaker PRIVATE navi_qwen3tts navi_runtime)
-add_test(NAME speaker COMMAND test_speaker "${NAVI_TEST_MODEL}" "${CMAKE_SOURCE_DIR}/tests/reference")
+add_executable(test_codec_encoder tests/test_codec_encoder.cpp)
+target_link_libraries(test_codec_encoder PRIVATE navi_qwen3tts navi_runtime)
+add_executable(test_icl_synth tests/test_icl_synth.cpp)
+target_link_libraries(test_icl_synth PRIVATE navi_qwen3tts navi_runtime)
+# Host-only: the voice store needs no model and no device, so it is registered once.
+add_executable(test_voice_store tests/test_voice_store.cpp)
+target_link_libraries(test_voice_store PRIVATE navi_runtime)
+
+# navi_add_gates(<suffix> <model.navi> <reference dir>)
+function(navi_add_gates suffix model ref)
+    add_test(NAME tokenizer${suffix} COMMAND test_tokenizer "${model}" "${ref}/tokenizer_cases.json")
+    add_test(NAME vocoder${suffix} COMMAND test_vocoder "${model}" "${ref}" "${CMAKE_BINARY_DIR}/vocoder_out${suffix}.wav")
+    add_test(NAME prefill${suffix} COMMAND test_prefill "${model}" "${ref}")
+    add_test(NAME frame${suffix} COMMAND test_frame "${model}" "${ref}")
+    add_test(NAME speaker${suffix} COMMAND test_speaker "${model}" "${ref}")
+    # Skips itself (exit 0) on a blob converted without --with-encoder.
+    add_test(NAME codec_encoder${suffix} COMMAND test_codec_encoder "${model}" "${ref}")
+    # Uses stored codes, so it needs no encoder - that is what it checks.
+    add_test(NAME icl_synth${suffix} COMMAND test_icl_synth "${model}" "${ref}")
+endfunction()
+
+add_test(NAME voice_store COMMAND test_voice_store "${CMAKE_BINARY_DIR}/voice_store_test")
+navi_add_gates("" "${NAVI_TEST_MODEL}" "${CMAKE_SOURCE_DIR}/tests/reference")
+if(EXISTS "${NAVI_TEST_MODEL_17B}" AND EXISTS "${NAVI_TEST_REFERENCE_17B}/manifest.json")
+    navi_add_gates("-1.7b" "${NAVI_TEST_MODEL_17B}" "${NAVI_TEST_REFERENCE_17B}")
+    message(STATUS "1.7B gates enabled (${NAVI_TEST_MODEL_17B})")
+else()
+    message(STATUS "1.7B gates skipped: no ${NAVI_TEST_MODEL_17B} (tools/convert.py) "
+                   "or no dumps in ${NAVI_TEST_REFERENCE_17B} (tools/dump_reference.py)")
+endif()
 
 # The contention hog (tests/contention.sh): not a ctest, run on purpose and briefly.
 add_executable(gpu_hog)

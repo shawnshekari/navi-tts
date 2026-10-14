@@ -8,8 +8,10 @@
 #include <cstdint>
 #include <hip/hip_fp16.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <vector>
 
 namespace navi::qwen3tts {
 
@@ -22,6 +24,25 @@ __global__ void k_gather_rows(const unsigned short * table, const int * ids, int
     const unsigned short * src = table + static_cast<std::size_t>(ids[blockIdx.x]) * width;
     float * dst = out + static_cast<std::size_t>(blockIdx.x) * width;
     for (int i = threadIdx.x; i < width; i += blockDim.x) dst[i] = dev::half_bits_to_float(src[i]);
+}
+
+// rows[t] = codec_embedding[codes[t][0]] + sum_{g=1..G-1} cp_codec_embedding[g-1][codes[t][g]],
+// at the TALKER's width. These are the same 16 rows the frame kernel's assemble_step sums
+// to build the next frame's input: the code predictor's embedding tables are stored at the
+// talker's width for exactly this reason (docs/model.md "Code predictor"). One block per
+// reference frame; the sum runs g = 0..G-1, as the reference's codec_embed.sum(1) does.
+struct FrameTables { const unsigned short * tab[16]; };
+
+__global__ void k_gather_frames(FrameTables tabs, const int * codes, int n_groups, int width, float * out) {
+    const int * code = codes + static_cast<std::size_t>(blockIdx.x) * n_groups;
+    float * dst = out + static_cast<std::size_t>(blockIdx.x) * width;
+    for (int i = threadIdx.x; i < width; i += blockDim.x) {
+        float v = 0.f;
+        for (int g = 0; g < n_groups; ++g) {
+            v += dev::half_bits_to_float(tabs.tab[g][static_cast<std::size_t>(code[g]) * width + i]);
+        }
+        dst[i] = v;
+    }
 }
 
 // out[t] = (ia[t] >= 0 ? A[ia[t]] : 0) + (ib[t] >= 0 ? B[ib[t]] : 0) + (t == spk_row ? spk : 0)
@@ -84,6 +105,9 @@ __global__ void k_qk_norm_rope(float * q, float * k, const float * v, int row_st
 // Causal GQA attention for the prefill: block per (t, q-head), keys 0..pos0+t
 // from the f16 cache. Scores in LDS (MAX_KEYS), softmax in f32.
 constexpr int MAX_KEYS = 1024;
+// Where the ICL reference frames' rows start in codec_rows: after the widest control
+// block (4 think rows + codec_pad + codec_bos).
+constexpr int ICL_FRAME0 = 6;
 
 __global__ void k_prefill_attention(const float * q, int q_stride, const unsigned short * kcache, const unsigned short * vcache,
                                     int n_head, int n_kv_head, int head_dim, int kv_dim, int pos0, float * out) {
@@ -142,6 +166,11 @@ struct Talker::Impl {
     int * d_ids = nullptr, * d_cids = nullptr, * d_ia = nullptr, * d_ib = nullptr;
     float * text_rows = nullptr, * fc1_out = nullptr, * proj = nullptr, * codec_rows = nullptr, * d_spk = nullptr;
     Prompt prompt;
+    // in-context cloning: the reference frames' summed embeddings live in codec_rows after
+    // the control rows, at a fixed offset so the layout does not move with the think block
+    int max_ref = 0;
+    int * d_ref_codes = nullptr;
+    FrameTables frame_tabs{};
 
     // prefill scratch
     float * x = nullptr, * n = nullptr, * qkv = nullptr, * att = nullptr, * gu = nullptr,
@@ -198,7 +227,7 @@ DeviceWeights::Groups Talker::fused_groups(const Params & p) {
 }
 
 std::unique_ptr<Talker> Talker::create(const Device & dev, const DeviceWeights & w, const Params & p,
-                                       int max_prompt_tokens, int max_positions) {
+                                       int max_prompt_tokens, int max_positions, int max_ref_frames) {
     std::unique_ptr<Talker> t(new Talker());
     t->impl_ = std::make_unique<Impl>();
     Impl & I = *t->impl_;
@@ -252,12 +281,32 @@ std::unique_ptr<Talker> Talker::create(const Device & dev, const DeviceWeights &
         I.kv.v.push_back(I.alloc<unsigned short>(static_cast<std::size_t>(max_positions) * KV));
     }
 
-    const std::size_t M = static_cast<std::size_t>(max_prompt_tokens) + 8;
+    // In-context cloning: the code predictor's 15 embedding tables, plus the talker's own
+    // for codebook 0. Loaded only when ICL is enabled, so a narrow upload filter that does
+    // not include them still works for the embedding-only path.
+    I.max_ref = max_ref_frames;
+    if (I.max_ref > 0) {
+        if (p.n_code_groups > 16) fail("talker: more than 16 codebooks does not fit the ICL gather");
+        I.frame_tabs.tab[0] = I.codec_emb;
+        for (int g = 1; g < p.n_code_groups; ++g) {
+            I.frame_tabs.tab[g] = f16p("talker.code_predictor.model.codec_embedding."
+                                       + std::to_string(g - 1) + ".weight");
+        }
+    }
+    // The prefill is `max_prompt_tokens + 8` rows in the embedding-only form and
+    // `10 + max_ref_frames` in the ICL one, which does not depend on the text length; every
+    // prompt and prefill buffer is sized for whichever is larger.
+    const std::size_t M = std::max(static_cast<std::size_t>(max_prompt_tokens) + 8,
+                                   static_cast<std::size_t>(I.max_ref) + 10);
     I.d_ids = I.alloc<int>(M); I.d_cids = I.alloc<int>(16); I.d_ia = I.alloc<int>(M); I.d_ib = I.alloc<int>(M);
     I.text_rows = I.alloc<float>(M * p.text_hidden);
     I.fc1_out = I.alloc<float>(M * p.text_hidden);
     I.proj = I.alloc<float>(M * H);
-    I.codec_rows = I.alloc<float>(16 * H);
+    // codec_rows: 6 control rows (think block, codec_pad, codec_bos) then one per
+    // reference frame at a FIXED offset, so a 3-row think block and a 4-row one share one
+    // layout.
+    I.codec_rows = I.alloc<float>(static_cast<std::size_t>(ICL_FRAME0 + I.max_ref) * H);
+    if (I.max_ref > 0) I.d_ref_codes = I.alloc<int>(static_cast<std::size_t>(I.max_ref) * p.n_code_groups);
     I.d_spk = I.alloc<float>(H);
     I.prompt.prefill = I.alloc<float>(M * H);
     I.prompt.trailing = I.alloc<float>(M * H);
@@ -281,18 +330,51 @@ Talker::~Talker() {
 }
 
 const Prompt & Talker::build_prompt(std::span<const std::int32_t> ids, const std::string & language,
-                                    std::span<const float> speaker) {
+                                    std::span<const float> speaker, const IclRef * icl) {
     Impl & I = *impl_;
     const Params & p = I.p;
-    const int H = p.talker.hidden;
+    const int H = p.talker.hidden, G = p.n_code_groups;
     if (ids.size() < 9) fail("talker: prompt ids too short (need role header, text, and the trailer)");
-    if (static_cast<int>(ids.size()) > I.max_prompt) fail("talker: prompt longer than max_prompt_tokens");
     if (static_cast<int>(speaker.size()) != H) fail("talker: speaker embedding must be [hidden]");
 
-    // text rows to project: role header (3), text tokens ids[3:-5], tts_bos, tts_eos, tts_pad
+    // text rows to project: role header (3), the reference transcript's tokens if any, the
+    // text's tokens ids[3:-5], then tts_bos, tts_eos, tts_pad
     const int n_text = static_cast<int>(ids.size()) - 8;
     if (n_text < 1) fail("talker: empty text");
+    int n_ref = 0, n_frames = 0;
+    if (icl) {
+        if (I.max_ref <= 0) fail("talker: this talker was built without in-context cloning buffers");
+        n_frames = icl->n_frames;
+        if (n_frames <= 0) fail("talker: the reference has no frames");
+        if (n_frames > I.max_ref) {
+            fail("talker: the reference is " + std::to_string(n_frames) + " frames, past the "
+                 + std::to_string(I.max_ref) + " this talker was built for");
+        }
+        if (icl->codes.size() != static_cast<std::size_t>(n_frames) * G) {
+            fail("talker: the reference has " + std::to_string(icl->codes.size()) + " codes, not "
+                 + std::to_string(n_frames) + " x " + std::to_string(G));
+        }
+        // ids wrap the transcript as its own assistant turn: 3 role tokens, the text, then
+        // <|im_end|> and \n. The engine uses the text only.
+        if (icl->ids.size() < 6) fail("talker: the reference transcript is empty");
+        n_ref = static_cast<int>(icl->ids.size()) - 5;
+        for (int i = 0; i < n_frames * G; ++i) {
+            const int c = icl->codes[static_cast<std::size_t>(i)];
+            const int limit = (i % G) == 0 ? p.talker.vocab : p.cp.vocab;
+            if (c < 0 || c >= limit) {
+                fail("talker: reference code " + std::to_string(c) + " at frame "
+                     + std::to_string(i / G) + " codebook " + std::to_string(i % G)
+                     + " is outside [0, " + std::to_string(limit) + ")");
+            }
+        }
+    }
+    if (3 + n_ref + n_text + 3 > I.max_prompt + 8) {
+        fail("talker: " + std::to_string(n_ref + n_text) + " text tokens (reference and target) past the "
+             + std::to_string(I.max_prompt) + " this talker was built for");
+    }
+
     std::vector<int> tids(ids.begin(), ids.begin() + 3);
+    if (icl) tids.insert(tids.end(), icl->ids.begin() + 3, icl->ids.begin() + 3 + n_ref);
     tids.insert(tids.end(), ids.begin() + 3, ids.begin() + 3 + n_text);
     const int i_bos = static_cast<int>(tids.size()); tids.push_back(p.tts_bos_id);
     const int i_eos = static_cast<int>(tids.size()); tids.push_back(p.tts_eos_id);
@@ -313,20 +395,48 @@ const Prompt & Talker::build_prompt(std::span<const std::int32_t> ids, const std
     const int i_cbos = n_think + 1; cids.push_back(p.codec_bos_id);
 
     // prefill layout (docs/model.md): role rows, think rows (+tts_pad), speaker (+tts_pad),
-    // codec_pad (+tts_bos), codec_bos (+ first text token)
+    // codec_pad (+tts_bos), then either the one text+codec_bos row of the embedding-only
+    // form or the ICL block's 1 + n_frames rows.
     std::vector<int> ia, ib;
     for (int r = 0; r < 3; ++r) { ia.push_back(r); ib.push_back(-1); }
     for (int r = 0; r < n_think; ++r) { ia.push_back(i_pad); ib.push_back(r); }
     const int spk_row = static_cast<int>(ia.size());
     ia.push_back(i_pad); ib.push_back(-1);
     ia.push_back(i_bos); ib.push_back(i_cpad);
-    ia.push_back(3); ib.push_back(i_cbos);
-    const int n_prefill = static_cast<int>(ia.size());
-    // trailing: text tokens[1:] then tts_eos
+    const int i_text0 = 3;                      // the first text row after the role header
     std::vector<int> ta, tb;
-    for (int r = 1; r < n_text; ++r) { ta.push_back(3 + r); tb.push_back(-1); }
-    ta.push_back(i_eos); tb.push_back(-1);
+    if (!icl) {
+        ia.push_back(i_text0); ib.push_back(i_cbos);
+        // trailing: text tokens[1:] then tts_eos
+        for (int r = 1; r < n_text; ++r) { ta.push_back(i_text0 + r); tb.push_back(-1); }
+        ta.push_back(i_eos); tb.push_back(-1);
+    } else {
+        // The block's codec side is [codec_bos, frame_0 .. frame_{n-1}]; its text side is
+        // [reference transcript, target text, tts_eos] truncated to that length or padded
+        // with tts_pad, and whatever did not fit becomes the trailing rows.
+        const int n_textrows = n_ref + n_text + 1;          // the +1 is tts_eos
+        const int n_block = 1 + n_frames;
+        const auto text_row = [&](int j) { return j < n_ref + n_text ? i_text0 + j : i_eos; };
+        for (int j = 0; j < n_block; ++j) {
+            ia.push_back(j < n_textrows ? text_row(j) : i_pad);
+            ib.push_back(j == 0 ? i_cbos : ICL_FRAME0 + (j - 1));
+        }
+        for (int j = n_block; j < n_textrows; ++j) { ta.push_back(text_row(j)); tb.push_back(-1); }
+        if (ta.empty()) { ta.push_back(i_pad); tb.push_back(-1); }
+    }
+    const int n_prefill = static_cast<int>(ia.size());
     const int n_trailing = static_cast<int>(ta.size());
+    // The prefill attention keeps one LDS score per key, and used to be bounded by
+    // max_prompt_tokens; the ICL form's row count does not depend on the text length, so
+    // the bound is now its own check.
+    if (n_prefill > MAX_KEYS) {
+        fail("talker: " + std::to_string(n_prefill) + " prefill rows is past the " + std::to_string(MAX_KEYS)
+             + " the prefill attention keeps scores for");
+    }
+    if (n_prefill >= I.kv.max_pos) {
+        fail("talker: " + std::to_string(n_prefill) + " prefill rows does not leave room in a KV cache of "
+             + std::to_string(I.kv.max_pos) + " positions");
+    }
 
     NAVI_HIP(hipMemcpyAsync(I.d_ids, tids.data(), tids.size() * sizeof(int), hipMemcpyHostToDevice, I.stream));
     NAVI_HIP(hipMemcpyAsync(I.d_cids, cids.data(), cids.size() * sizeof(int), hipMemcpyHostToDevice, I.stream));
@@ -335,6 +445,12 @@ const Prompt & Talker::build_prompt(std::span<const std::int32_t> ids, const std
     I.gemm(I.fc1, I.fc1_b, I.text_rows, n_rows, p.text_hidden, p.text_hidden, I.fc1_out, p.text_hidden, PRO_NONE, EPI_SILU);
     I.gemm(I.fc2, I.fc2_b, I.fc1_out, n_rows, p.text_hidden, H, I.proj, H, PRO_NONE, EPI_NONE);
     k_gather_rows<<<static_cast<unsigned>(cids.size()), 256, 0, I.stream>>>(I.codec_emb, I.d_cids, H, I.codec_rows);
+    if (icl) {
+        NAVI_HIP(hipMemcpyAsync(I.d_ref_codes, icl->codes.data(), icl->codes.size() * sizeof(int),
+                                hipMemcpyHostToDevice, I.stream));
+        k_gather_frames<<<static_cast<unsigned>(n_frames), 256, 0, I.stream>>>(
+            I.frame_tabs, I.d_ref_codes, G, H, I.codec_rows + static_cast<std::size_t>(ICL_FRAME0) * H);
+    }
 
     NAVI_HIP(hipMemcpyAsync(I.d_ia, ia.data(), ia.size() * sizeof(int), hipMemcpyHostToDevice, I.stream));
     NAVI_HIP(hipMemcpyAsync(I.d_ib, ib.data(), ib.size() * sizeof(int), hipMemcpyHostToDevice, I.stream));

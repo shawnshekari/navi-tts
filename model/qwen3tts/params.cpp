@@ -54,6 +54,81 @@ void add_decoder_layers(std::vector<ExpectedTensor> & out, const std::string & p
     }
 }
 
+// The codec encoder (ICL cloning), laid out the way MimiEncoder builds itself so that a
+// config with different ratios still lands on the right layer indices: layer 0 is the input
+// conv, then per ratio a residual unit, an ELU (no tensors) and a strided downsample, and
+// finally an ELU and the output conv. Only what encoding uses is listed - no output_proj,
+// and only the codebooks the talker has embeddings for (tools/convert.py::encoder_keep).
+void add_codec_encoder(std::vector<ExpectedTensor> & out, const Params & p) {
+    const Params::CodecEncoder & e = p.codec_encoder;
+    const std::string pre = "codec.encoder.";
+    const auto u = [](int v) { return static_cast<std::uint64_t>(v); };
+
+    int dim = e.num_filters, idx = 0, prod = 1;
+    for (int r : e.ratios) prod *= r;
+    out.push_back({pre + "encoder.layers.0.conv.weight", {u(dim), 1, u(e.kernel_size)}});
+    out.push_back({pre + "encoder.layers.0.conv.bias", {u(dim)}});
+    ++idx;
+    for (std::size_t r = e.ratios.size(); r-- > 0;) {   // the encoder walks the ratios reversed
+        const int stride = e.ratios[r], inner = dim / e.compress;
+        for (int j = 0; j < e.num_residual_layers; ++j) {
+            const std::string b = pre + "encoder.layers." + std::to_string(idx) + ".block.";
+            out.push_back({b + "1.conv.weight", {u(inner), u(dim), u(e.residual_kernel_size)}});
+            out.push_back({b + "1.conv.bias", {u(inner)}});
+            out.push_back({b + "3.conv.weight", {u(dim), u(inner), 1}});
+            out.push_back({b + "3.conv.bias", {u(dim)}});
+            ++idx;
+        }
+        ++idx;   // ELU
+        const std::string c = pre + "encoder.layers." + std::to_string(idx) + ".conv.";
+        out.push_back({c + "weight", {u(dim * 2), u(dim), u(stride * 2)}});   // kernel = 2 x stride
+        out.push_back({c + "bias", {u(dim * 2)}});
+        ++idx;
+        dim *= 2;
+    }
+    ++idx;   // ELU
+    const std::string last = pre + "encoder.layers." + std::to_string(idx) + ".conv.";
+    out.push_back({last + "weight", {u(e.latent), u(dim), u(e.last_kernel_size)}});
+    out.push_back({last + "bias", {u(e.latent)}});
+
+    // Its transformer is not a Qwen3 decoder: LayerNorm with bias instead of RMSNorm, no GQA,
+    // no QK-norm, and an MLP of two bias-free Linears with GELU between them.
+    const auto L = u(e.latent), F = u(e.ff);
+    for (int l = 0; l < e.n_layer; ++l) {
+        const std::string t = pre + "encoder_transformer.layers." + std::to_string(l) + ".";
+        for (const char * n : {"input_layernorm", "post_attention_layernorm"}) {
+            out.push_back({t + n + ".weight", {L}});
+            out.push_back({t + n + ".bias", {L}});
+        }
+        for (const char * n : {"q_proj", "k_proj", "v_proj", "o_proj"}) {
+            out.push_back({t + "self_attn." + n + ".weight", {L, L}});
+        }
+        out.push_back({t + "mlp.fc1.weight", {F, L}});
+        out.push_back({t + "mlp.fc2.weight", {L, F}});
+        out.push_back({t + "self_attn_layer_scale.scale", {L}});
+        out.push_back({t + "mlp_layer_scale.scale", {L}});
+    }
+
+    // 25 Hz -> 12.5 Hz. read_params has already checked that the ratios and the declared
+    // samples per frame agree, so this stride is 2 and its kernel 4; it is derived anyway.
+    const int ds = prod > 0 ? e.downsample_rate / prod : 0;
+    out.push_back({pre + "downsample.conv.weight", {L, L, u(2 * ds)}});
+
+    // Split RVQ. Encoding needs each group's input_proj and the codebooks themselves;
+    // the acoustic group quantises the FULL latent, not the semantic residual.
+    const auto VQ = u(e.vq_dim), CS = u(e.codebook_size), CD = u(e.codebook_dim);
+    const std::string sem = pre + "quantizer.semantic_residual_vector_quantizer.";
+    out.push_back({sem + "input_proj.weight", {VQ, L, 1}});
+    for (int i = 0; i < e.n_semantic; ++i) {
+        out.push_back({sem + "layers." + std::to_string(i) + ".codebook.codebook", {CS, CD}});
+    }
+    const std::string aco = pre + "quantizer.acoustic_residual_vector_quantizer.";
+    out.push_back({aco + "input_proj.weight", {VQ, L, 1}});
+    for (int i = 0; i < e.n_valid_q - e.n_semantic; ++i) {
+        out.push_back({aco + "layers." + std::to_string(i) + ".codebook.codebook", {CS, CD}});
+    }
+}
+
 } // namespace
 
 Params read_params(const NaviFile & f) {
@@ -116,6 +191,62 @@ Params read_params(const NaviFile & f) {
     p.vocoder_upsample_rates     = to_int(f.kv_i64_array("codec.decoder.upsample_rates"));
     p.vocoder_upsampling_ratios  = to_int(f.kv_i64_array("codec.decoder.upsampling_ratios"));
     p.has_codec_encoder = f.kv_i64_or("general.has_codec_encoder", 0) != 0;
+    if (p.has_codec_encoder) {
+        Params::CodecEncoder & e = p.codec_encoder;
+        const std::string ns = "codec.encoder.";
+        e.latent      = static_cast<int>(f.kv_i64(ns + "hidden_size"));
+        e.n_layer     = static_cast<int>(f.kv_i64(ns + "num_hidden_layers"));
+        e.n_head      = static_cast<int>(f.kv_i64(ns + "num_attention_heads"));
+        e.head_dim    = static_cast<int>(f.kv_i64(ns + "head_dim"));
+        e.ff          = static_cast<int>(f.kv_i64(ns + "intermediate_size"));
+        e.norm_eps    = static_cast<float>(f.kv_f64(ns + "norm_eps"));
+        e.rope_theta  = f.kv_f64(ns + "rope_theta");
+        e.max_pos     = static_cast<int>(f.kv_i64(ns + "max_position_embeddings"));
+        e.layer_scale = static_cast<float>(f.kv_f64(ns + "layer_scale_initial_scale"));
+        e.num_filters = static_cast<int>(f.kv_i64(ns + "num_filters"));
+        e.kernel_size          = static_cast<int>(f.kv_i64(ns + "kernel_size"));
+        e.last_kernel_size     = static_cast<int>(f.kv_i64(ns + "last_kernel_size"));
+        e.residual_kernel_size = static_cast<int>(f.kv_i64(ns + "residual_kernel_size"));
+        e.compress             = static_cast<int>(f.kv_i64(ns + "compress"));
+        e.dilation_growth_rate = static_cast<int>(f.kv_i64(ns + "dilation_growth_rate"));
+        e.num_residual_layers  = static_cast<int>(f.kv_i64(ns + "num_residual_layers"));
+        e.ratios        = to_int(f.kv_i64_array(ns + "upsampling_ratios"));
+        e.codebook_dim  = static_cast<int>(f.kv_i64(ns + "codebook_dim"));
+        e.codebook_size = static_cast<int>(f.kv_i64(ns + "codebook_size"));
+        e.n_q           = static_cast<int>(f.kv_i64(ns + "num_quantizers"));
+        e.n_semantic    = static_cast<int>(f.kv_i64(ns + "num_semantic_quantizers"));
+        e.vq_dim        = static_cast<int>(f.kv_i64(ns + "vector_quantization_hidden_dimension"));
+        e.n_valid_q       = static_cast<int>(f.kv_i64("codec.encoder_valid_num_quantizers"));
+        e.downsample_rate = static_cast<int>(f.kv_i64("codec.encode_downsample_rate"));
+        e.sample_rate     = static_cast<int>(f.kv_i64("codec.input_sample_rate"));
+        e.dtype = f.has_kv("general.codec_encoder_dtype") ? f.kv_str("general.codec_encoder_dtype") : p.dtype;
+        // What the engine assumes about this component, checked once here instead of in a kernel.
+        int prod = 1;
+        for (int r : e.ratios) prod *= r;
+        if (e.ratios.empty() || prod * 2 != e.downsample_rate) {
+            fail(f.path() + ": the codec encoder's ratios multiply to " + std::to_string(prod)
+                 + " and its downsample is stride 2, which is " + std::to_string(prod * 2)
+                 + " samples per frame, not the " + std::to_string(e.downsample_rate) + " it declares");
+        }
+        if (e.n_valid_q != p.n_code_groups) {
+            fail(f.path() + ": the codec encoder emits " + std::to_string(e.n_valid_q)
+                 + " codebooks but the talker has embeddings for " + std::to_string(p.n_code_groups));
+        }
+        if (e.n_valid_q < 1 || e.n_valid_q > e.n_q) fail(f.path() + ": bad encoder_valid_num_quantizers");
+        if (e.n_semantic != 1) {
+            fail(f.path() + ": the engine assumes one semantic quantizer, this blob has "
+                 + std::to_string(e.n_semantic));
+        }
+        if (e.latent != e.n_head * e.head_dim) {
+            fail(f.path() + ": the codec encoder's transformer is " + std::to_string(e.latent)
+                 + " wide but its heads cover " + std::to_string(e.n_head * e.head_dim));
+        }
+        if (e.num_filters % e.compress != 0) fail(f.path() + ": num_filters is not a multiple of compress");
+        if (e.sample_rate != p.spk_sample_rate) {
+            fail(f.path() + ": the codec encoder wants " + std::to_string(e.sample_rate)
+                 + " Hz audio and the speaker encoder " + std::to_string(p.spk_sample_rate));
+        }
+    }
 
     p.temperature        = static_cast<float>(f.has_kv("gen.temperature") ? f.kv_f64("gen.temperature") : 1.0);
     p.top_p              = static_cast<float>(f.has_kv("gen.top_p") ? f.kv_f64("gen.top_p") : 1.0);
@@ -154,11 +285,19 @@ std::vector<ExpectedTensor> expected_tensors(const Params & p) {
     out.push_back({"talker.model.norm.weight", {H}});
     out.push_back({"talker.codec_head.weight", {CV, H}});
 
-    // code predictor: codebooks 1..15 each have an input embedding and a head
+    // Code predictor: codebooks 1..15 each have an input embedding and a head.
+    // The embeddings are stored at the TALKER's width, not the predictor's: the
+    // same rows also feed the talker's next-frame input (docs/model.md "Code
+    // predictor"). When the two widths differ the predictor's input is projected
+    // down first; when they are equal that stage is the identity and absent.
     const auto CH = static_cast<std::uint64_t>(p.cp.hidden);
     for (std::uint64_t i = 0; i + 1 < G; ++i) {
-        out.push_back({"talker.code_predictor.model.codec_embedding." + std::to_string(i) + ".weight", {PV, CH}});
+        out.push_back({"talker.code_predictor.model.codec_embedding." + std::to_string(i) + ".weight", {PV, H}});
         out.push_back({"talker.code_predictor.lm_head." + std::to_string(i) + ".weight", {PV, CH}});
+    }
+    if (p.cp.hidden != p.talker.hidden) {
+        out.push_back({"talker.code_predictor.small_to_mtp_projection.weight", {CH, H}});
+        out.push_back({"talker.code_predictor.small_to_mtp_projection.bias", {CH}});
     }
     add_decoder_layers(out, "talker.code_predictor.model", p.cp, true);
     out.push_back({"talker.code_predictor.model.norm.weight", {CH}});
@@ -280,6 +419,7 @@ std::vector<ExpectedTensor> expected_tensors(const Params & p) {
         out.push_back({last + ".conv.weight", {1, width, 7}});
         out.push_back({last + ".conv.bias", {1}});
     }
+    if (p.has_codec_encoder) add_codec_encoder(out, p);
     return out;
 }
 

@@ -1,4 +1,4 @@
-# Qwen3-TTS-12Hz-0.6B-Base: what the engine needs to know
+# Qwen3-TTS-12Hz Base: what the engine needs to know
 
 Re-derived at M0 from the HF release (`config.json`, `speech_tokenizer/config.json`,
 `generation_config.json`, the safetensors headers) and the model's own
@@ -6,16 +6,41 @@ Re-derived at M0 from the HF release (`config.json`, `speech_tokenizer/config.js
 number here is also in the `.navi` KV section (`docs/navi-format.md`), which is
 what the engine actually reads; this file is the human copy.
 
+Shapes below are the **0.6B-Base**, the model the engine shipped with. The
+**1.7B-Base** is the same architecture with a wider talker, supported since
+2026-10-13; the two differ in exactly four numbers, and only one of them needs
+engine code rather than configuration:
+
+| | 0.6B-Base | 1.7B-Base |
+|---|---|---|
+| talker hidden | 1024 | **2048** |
+| talker intermediate | 3072 | **6144** |
+| speaker encoder output | 1024 | **2048** |
+| code predictor hidden | 1024 | 1024 |
+| `small_to_mtp_projection` | absent (Identity) | **2048 -> 1024, with bias** |
+
+Everything else - the code predictor's layer count and shapes, the codec, the
+whole vocoder, the tokenizer, the special ids, the language ids - is identical.
+See "Code predictor" for the projection, which is the one place the widths stop
+being interchangeable.
+
+Switching between the two is a different model file and nothing else, with one
+operational catch: a **stored voice holds an embedding of its model's width**, so
+the voice store skips voices whose width does not match the loaded model (it says
+so on stderr). Re-clone them from their reference audio after a switch
+(`navi-tts voices add`, or `POST /v1/audio/voices`); the stored
+`sample.wav` makes that a local operation.
+
 ## Components
 
 | Component | Params | Tensors | Prefix |
 |---|---|---|---|
 | Text embedding + projection | 151936 × 2048 table, MLP 2048→2048→1024 | 5 | `talker.model.text_embedding`, `talker.text_projection.*` |
 | Talker | 28 layers, 1024 hidden | 311 | `talker.model.*`, `talker.codec_head` |
-| Code predictor | 5 layers, 1024 hidden, 15 heads | 86 | `talker.code_predictor.*` |
+| Code predictor | 5 layers, 1024 hidden, 15 heads | 86 (88 on the 1.7B, with the projection) | `talker.code_predictor.*` |
 | Speaker encoder | ECAPA-TDNN → 1024 | 76 | `speaker_encoder.*` |
 | Codec decoder (vocoder) | 8-layer transformer + convnet | 261 (after baking codebooks) | `codec.decoder.*` |
-| Codec encoder | not converted by default (ICL cloning is OPEN) | — | `codec.encoder.*` |
+| Codec encoder | 8-layer transformer + conv stack + split RVQ, f32 | 143 (only with `--with-encoder`) | `codec.encoder.*` |
 
 Safetensors dtypes: the main checkpoint is BF16 throughout, the codec F32.
 Converted: F16 for ≥2-D tensors, F32 for 1-D. Every BF16 value is exactly
@@ -136,16 +161,59 @@ projected, are the per-frame text rows: frame `i`'s input is the frame's summed
 code embedding plus `trailing[i]`, or plus the `tts_pad` row once the text is
 exhausted. (`tests/reference/trailing_text.npy`, `tts_pad_embed.npy`.)
 
+
+### Prompt layout (in-context cloning)
+
+In-context cloning (ICL) conditions on a reference clip's **codes** plus its
+**transcript**, on top of the speaker embedding. The first nine rows are the same as
+above. What changes is row 9: instead of one row (first text token + `codec_bos`),
+there is a block of `1 + T_ref` rows, where `T_ref` is the reference's
+frame count at 12.5 Hz:
+
+| | codec side | text side |
+|---|---|---|
+| block row 0 | `codec_bos` | reference transcript token 0 |
+| block row j | reference frame `j-1` | the next text token |
+
+The codec side of a frame row is the **sum of its 16 code embeddings at the talker's
+width** - codebook 0 from `talker.model.codec_embedding`, codebooks 1..15 from the
+code predictor's tables, exactly the rows `assemble_step` sums to build a frame's
+next input (see "Code predictor" for why they are stored at that width).
+
+The text side is one sequence - **the reference transcript, then the target text, then
+`tts_eos`** - laid along those rows and right-padded with `tts_pad` if it is
+shorter. Whatever does not fit becomes the per-frame trailing text, exactly as in the
+embedding-only form. So a long reference (the usual case) leaves a single
+`tts_pad` trailing row, with the whole text already in the prompt; a short one
+leaves real text to feed frame by frame. The reference transcript is wrapped as its own
+assistant turn (`<|im_start|>assistant\n{ref}<|im_end|>\n`) and sliced `[3:-2]`,
+while the target text keeps its `[3:-5]` slice.
+
+Sizes, measured: the 15 s parity clip is 188 frames, so 198 prefill rows against the
+embedding-only 10; a 20 s reference is 250 frames and 260 rows.
+
+**What this costs is not confined to the prefill.** The talker attends over
+`n_prefill + frame_index` keys, so a 250-frame reference adds 250 keys to *every*
+frame, not just to the one-off prompt pass. `bench --ref-text` reports per-position
+frame times for that reason (`docs/tuning.md`).
+
+A voice carries its codes with it: the codec is the same checkpoint in every model of
+this family (same safetensors sha256 for the 0.6B and the 1.7B), so **reference codes
+survive a model switch even though the speaker embedding does not**, and a blob without
+the encoder can still serve a voice whose codes were made by one that has it. It just
+cannot make new ones.
+
 ### One frame
 
 1. Talker step on the input row at position `n_past` → post-norm hidden `h` (1024) → `codec_head` → 3072 logits.
 2. Suppress ids 2048–3071 except `codec_eos` (2050); repetition penalty 1.05 over the codes emitted so far; sample cb0 (temperature 0.9, top-k 50, top-p 1.0 by default). The model's generate also forces at least 2 frames before EOS.
 3. cb0 == `codec_eos` ends the utterance (the frame is not emitted).
-4. Code predictor: a 2-row prefill `[h, talker.codec_embedding(cb0)]` at positions 0 and 1 gives codebook 1 from `lm_head[0]`; then for `i = 1..14` the row `cp.codec_embedding[i-1](code_i)` at position `i + 1` gives codebook `i + 1` from `lm_head[i]`. 16 positions per frame, causal, its own KV cache reset per frame; plain RoPE. Sampling per step with the `subtalker_*` defaults (0.9 / 50 / 1.0). (For a model whose cp hidden differs from the talker's, a `small_to_mtp_projection` Linear sits in front; it is Identity for the 0.6B and absent from its checkpoint.)
+4. Code predictor: a 2-row prefill `[h, talker.codec_embedding(cb0)]` at positions 0 and 1 gives codebook 1 from `lm_head[0]`; then for `i = 1..14` the row `cp.codec_embedding[i-1](code_i)` at position `i + 1` gives codebook `i + 1` from `lm_head[i]`. 16 positions per frame, causal, its own KV cache reset per frame; plain RoPE. Sampling per step with the `subtalker_*` defaults (0.9 / 50 / 1.0). Every one of those rows is at the talker's width and goes through `small_to_mtp_projection` first when the two widths differ (the 1.7B); for the 0.6B that stage is Identity and absent from the checkpoint. See "Code predictor".
 5. Next talker input = `codec_embedding(cb0) + Σ_i cp.codec_embedding[i](code_{i+1})` + the trailing text row.
 
 The talker's hidden fed to the code predictor is the **post-final-norm** hidden
 (`tests/reference/prefill_hidden.npy` is that vector at the last prefill position).
+
 
 ## Code predictor
 
@@ -154,8 +222,39 @@ The talker's hidden fed to the code predictor is the **post-final-norm** hidden
 | layers | 5 (same layer structure as the talker, with QK-norm) |
 | hidden / heads / KV heads / head_dim / intermediate | 1024 / 16 / 8 / 128 / 3072 |
 | rms_norm_eps, rope_theta | 1e-6, 1e6 (plain RoPE, positions 0..16 within a frame) |
-| per codebook 1..15 | `model.codec_embedding.{i}.weight` 2048 × 1024, `lm_head.{i}.weight` 2048 × 1024 |
+| per codebook 1..15 | `model.codec_embedding.{i}.weight` 2048 × **talker hidden**, `lm_head.{i}.weight` 2048 × cp hidden |
 | final norm | `model.norm.weight` |
+
+### The two widths, and `small_to_mtp_projection`
+
+The predictor's 15 input embedding tables are stored at the **talker's** width,
+not its own. That is not a quirk of the checkpoint: HF constructs the predictor
+with `embedding_dim = talker_config.hidden_size` because those same rows do
+double duty - they are also what the talker's next frame input is built from
+(`codec_hiddens.sum(1)` in the talker's forward, `assemble_step` here).
+
+So the predictor's input arrives at the talker's width and has to reach its own:
+
+- **widths equal (0.6B, both 1024):** nothing to do. HF's stage is
+  `nn.Identity()` and the two tensors are absent from the checkpoint.
+- **widths differ (1.7B, 2048 -> 1024):** `small_to_mtp_projection`, a Linear
+  with bias, applied to **every** one of the 16 positions - the talker's hidden at
+  position 0, the talker's codebook-0 embedding at 1, and each fed-back code after
+  that. Not only the prefill rows.
+
+In the engine (`model/qwen3tts/frame.hip`, `cp_embed`) each block stages
+the talker-width row into its own LDS and the projection is one grid matvec, with
+the bias folded into its write site. It needs no extra barrier, because every block
+can name the source row by itself: `codes[]` and the talker's hidden are both
+written before the barrier that already precedes the phase. `assemble_step` is
+the mirror image and works at the talker's width.
+
+A blob whose projection is missing or the wrong shape when the widths differ is
+refused at load by `validate()`, not in a kernel.
+
+`tests/reference-1.7b/cp_inputs.npy` is the float-level gate on this stage; the
+codes gate does not cover it (see that directory's README for the measurement that
+shows why).
 
 ## Speaker encoder
 
@@ -172,6 +271,65 @@ concatenated, 1536→1536; attentive statistics pooling (`asp.tdnn`
 weighted mean and std); `fc` 3072→1024 k=1. Output 1024-d, used directly as a
 prompt row. Runs once per clone. Reference: `tests/reference/speaker_mels.npy`
 → `speaker_embedding.npy`.
+
+## Codec encoder
+
+Only in a blob converted with `--with-encoder`, and only used to *make* reference
+codes for in-context cloning: 24 kHz audio in, 16 codes per 12.5 Hz frame out. It runs
+once per clone, like the speaker encoder, never per frame.
+
+It is a **Mimi** encoder with the decoder halves nulled out, 47.6 M values in the 143
+tensors the engine keeps:
+
+1. **SEANet conv stack**, causal, ELU, identity-shortcut residual units:
+   `conv 1->64 k7`, then for each ratio in `[4, 5, 6, 8]` (the config's
+   `upsampling_ratios` reversed) a residual unit
+   `x + conv_k1(ELU(conv_k3(ELU(x))))` with inner width `dim/2`, an ELU, and a
+   downsampling `conv dim->2*dim` with `k = 2*stride`; then an ELU and
+   `conv 1024->512 k3`. Total stride 960, so 25 Hz.
+2. **8-layer transformer**, hidden 512, 8 heads x 64, **LayerNorm with bias** (eps 1e-5 -
+   the only LayerNorms outside the vocoder's ConvNeXt blocks), MLP 512->2048->512 with no
+   bias and exact (erf) GELU, LayerScale on both branches, RoPE theta=1e4.
+3. **`downsample`**: `conv 512->512 k4 stride 2`, no bias. 25 Hz -> 12.5 Hz.
+4. **Split RVQ encode**: `input_proj` 512->256 per group, then nearest centroid with
+   residual subtraction - codebook 0 from the 1-quantizer *semantic* group, codebooks
+   1..15 from the first 15 of the *acoustic* group's 31. The acoustic group quantises the
+   **full** latent, not the semantic residual. Codebooks are
+   `embed_sum / clamp(cluster_usage, 1e-5)`, baked by the converter.
+
+Three facts that are not visible in the config, each measured on this box:
+
+- **The attention is full causal.** The encoder config says `sliding_window: 250` and
+  transformers 4.57.3 never applies it: setting it to 8, 64 or `None` changes the
+  output by exactly 0.0, and a hand-rolled full-causal layer matches the module at
+  2.4e-7 rel-rms where a windowed one is off by 1.7e-2. The dumps record the transformers
+  version; a release that started honouring the window would change the codes.
+- **`downsample` pads by replicating a row**, not with zeros, on both sides - the
+  one conv in this model that does (`pad_mode="replicate"` in its constructor).
+  Every other conv left-pads with zeros, plus a right "extra" pad computed from the
+  length so the stride divides it. That extra pad is zero whenever the length is a
+  multiple of 1920, and non-zero for the 15 s parity clip (360,000 samples = 187.5
+  frames -> 188, which costs one replicated row at 25 Hz: 375 rows -> 188 frames is a
+  ceil, not a halving).
+- **The weights are stored f32** while the decoder's stay f16. Not a style choice: the
+  output is 16 nearest-centroid searches per frame, a cascade with no error averaging,
+  so f16 weights change **38 of 3008** codes on the parity clip and move the ICL
+  prefill's hidden state by **1.27e-2 rel-rms** - 36x the talker prefill gate. A 1.2e-5
+  relative tie in codebook 6 flips that code and every later codebook of the frame then
+  diverges by much more. cb0, the semantic code, never flipped at any precision tried.
+  The cost is 190 MB of VRAM and 0 ms per frame. The engine's encoder kernels read f32
+  only and refuse any other dtype by tensor name, rather than quietly reinterpreting it.
+  (`tests/reference/ref_codes_f16w.npy` is that measurement.)
+
+In the engine (`model/qwen3tts/codec_encoder.hip`) the conv stack is chunked in time
+with each conv's causal history threaded across chunks - a chunked encode equals a
+one-shot one, which is a gate - because its first level is 184 MB at the 30 s clip cap.
+Everything after it runs once over the whole sequence: 375 rows x 512 is 1.5 MB, so the
+transformer needs no KV cache and no cross-chunk state. Measured: all 3008 codes exact
+against the reference, stages within 7.5e-6 rel-rms, 606 ms for a 15 s clip.
+
+Reference: `tests/reference/ref_conv.npy`, `ref_xf.npy`,
+`ref_latents.npy`, `ref_codes.npy`.
 
 ## Codec decoder (vocoder)
 

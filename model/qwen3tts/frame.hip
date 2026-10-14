@@ -6,6 +6,7 @@
 
 #include <hip/hip_fp16.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 
@@ -23,11 +24,24 @@ constexpr int MAX_LAYERS = 32;
 constexpr int CP_MAX_LAYERS = 8;
 constexpr int CP_POS = 16;          // hidden, cb0, then 14 fed-back codes
 constexpr int CP_HEADS = 15;        // codebooks 1..15
-constexpr int VEC_MAX = 4096;       // largest LDS vector: ff 3072, vocab 3072
+// The LDS vector is sized per model at launch (Frame::create), not by a constant:
+// the 1.7B's talker ff is 6144 where the 0.6B's is 3072, and paying the larger of
+// the two on both would cost the smaller model occupancy it currently has.
+// VEC_FLOOR is the historical size and stays a floor for two reasons: attend()
+// keeps one score per key position in the vector, and Frame::create is not told
+// the Talker's max_positions (2048 by default), so the floor is what guarantees
+// the shipped configuration fits; and it keeps the 0.6B's LDS layout unchanged.
+constexpr int VEC_FLOOR = 4096;
+// Floats in the LDS block for a given vector size: [xs][red: 32][hist: 256][idx].
+constexpr int lds_floats(int vec) { return 2 * vec + 32 + 256; }
 constexpr int MV_ROWS = 2;         // rows per wave in a matvec: 2 rows x 4 loads in flight streams ~20% faster than 4 x 2 (bench/README)
 
 struct TlParams { int hidden, n_head, n_kv_head, head_dim, ff, vocab, n_layer; float eps, rope_theta; };
-struct CpParams { int hidden, n_head, n_kv_head, head_dim, ff, vocab, n_layer; float eps, rope_theta; };
+// in_dim: the width the code predictor's input embeddings are stored at, which
+// is the talker's hidden size (the same rows feed the talker's next-frame input).
+// It equals `hidden` on a model whose two widths match, and then there is no
+// projection stage and CpWeights::proj_w is null.
+struct CpParams { int hidden, in_dim, n_head, n_kv_head, head_dim, ff, vocab, n_layer; float eps, rope_theta; };
 
 struct TlWeights {
     const float * attn_norm[MAX_LAYERS], * q_norm[MAX_LAYERS], * k_norm[MAX_LAYERS], * ffn_norm[MAX_LAYERS];
@@ -45,6 +59,8 @@ struct CpWeights {
     const uint16_t * talker_codec_embd;
     const uint16_t * codec_embd[CP_HEADS];
     const uint16_t * lm_head[CP_HEADS];
+    const uint16_t * proj_w;   // small_to_mtp_projection [hidden][in_dim], null when the widths match
+    const float    * proj_b;   // its bias [hidden]
 };
 
 struct Work {
@@ -66,6 +82,9 @@ struct Work {
     const float * hidden_in, * logits_in;
     const float * step_in, * trailing;
     float * step_out;
+    int vec_max;                       // floats in the dynamic LDS vector (Frame::create)
+    float * cp_input_log;              // [CP_POS][cp hidden] capture of the predictor's projected
+                                       // inputs for the parity gate; null in production
     volatile unsigned * bar;           // [0] count, [1] sense, [2] abort
     unsigned long long spin_cap;
 #ifdef NAVI_FRAME_PROFILE
@@ -150,8 +169,13 @@ __device__ __forceinline__ void wave_dot_rows(const uint16_t * W, int row0, int 
 // in cycling groups of MV_ROWS. (A balanced contiguous partition, and fusing
 // q/k/v into one virtual matvec, were measured 2026-09-17: no change - the
 // phase ends when the memory system does, not when the last wave does.)
-template <bool ACCUMULATE>
-__device__ void grid_matvec(const uint16_t * W, int n_rows, int n_cols, const float * xs, float * y) {
+// BIAS (non-accumulating only) adds `bias` on the wave that owns the row, so no
+// second pass and no barrier is needed to make it visible. It is a template
+// parameter, not a nullable pointer, so the callers that have no bias - every
+// matvec on the per-frame path - compile exactly as they did before.
+template <bool ACCUMULATE, bool BIAS = false>
+__device__ void grid_matvec(const uint16_t * W, int n_rows, int n_cols, const float * xs, float * y,
+                            const float * bias = nullptr) {
     const int lane = threadIdx.x % warpSize, wpb = blockDim.x / warpSize;
     const int gwave = blockIdx.x * wpb + threadIdx.x / warpSize, nwave = gridDim.x * wpb;
     for (int row0 = gwave * MV_ROWS; row0 < n_rows; row0 += nwave * MV_ROWS) {
@@ -161,7 +185,9 @@ __device__ void grid_matvec(const uint16_t * W, int n_rows, int n_cols, const fl
             float d = acc[0];
 #pragma unroll
             for (int r = 1; r < MV_ROWS; ++r) if (lane == r) d = acc[r];
-            if (ACCUMULATE) y[row0 + lane] += d; else y[row0 + lane] = d;
+            if (ACCUMULATE) y[row0 + lane] += d;
+            else if (BIAS) y[row0 + lane] = d + bias[row0 + lane];
+            else y[row0 + lane] = d;
         }
     }
 }
@@ -202,12 +228,9 @@ __device__ int block_argmax(const float * v, int n, float * red) {
     return r;
 }
 
-// Sampling scratch: the top-k threshold by radix select and the multinomial
-// draw over the candidates only. One block (block 0), BLOCK threads.
-struct SampleScratch {
-    unsigned hist[256];   // one 8-bit digit's histogram
-    int idx[VEC_MAX];     // candidate indices, in order
-};
+// Sampling scratch lives in the same dynamic LDS block as the vector: `hist` is
+// one 8-bit digit's histogram for the radix select, `idx` the candidate indices
+// for the multinomial draw. One block (block 0), BLOCK threads.
 
 // float -> monotone unsigned key: larger float, larger key
 __device__ __forceinline__ unsigned float_key(float f) {
@@ -420,7 +443,7 @@ __device__ __forceinline__ float tl_modified_logit(const Work & B, int i) {
 
 // Block 0 samples cb0 into codes[0]: greedy if temperature <= 0, else
 // temperature, top-k threshold (bitonic sort), softmax, multinomial.
-__device__ void tl_sample(const TlParams & P, const Work & B, float * xs, float * red, SampleScratch & S) {
+__device__ void tl_sample(const TlParams & P, const Work & B, float * xs, float * red, unsigned * hist, int * idx) {
     if (blockIdx.x != 0) return;
     const int V = P.vocab;
     if (B.temperature <= 0.f) {
@@ -434,7 +457,7 @@ __device__ void tl_sample(const TlParams & P, const Work & B, float * xs, float 
     for (int i = threadIdx.x; i < V; i += blockDim.x) { xs[i] = tl_modified_logit(B, i) / B.temperature; m = fmaxf(m, xs[i]); }
     const float mx = dev::block_max(m, red);
     __syncthreads();
-    const float threshold = (B.top_k > 0 && B.top_k < V) ? block_kth_largest(xs, V, B.top_k, S.hist, red) : -INFINITY;
+    const float threshold = (B.top_k > 0 && B.top_k < V) ? block_kth_largest(xs, V, B.top_k, hist, red) : -INFINITY;
     __syncthreads();
     float ssum = 0.f;
     for (int i = threadIdx.x; i < V; i += blockDim.x) {
@@ -445,7 +468,7 @@ __device__ void tl_sample(const TlParams & P, const Work & B, float * xs, float 
     }
     ssum = dev::block_sum(ssum, red);
     __syncthreads();
-    const int chosen = block_draw(xs, V, 1.f / ssum, B.talker_seed, S.idx, red);
+    const int chosen = block_draw(xs, V, 1.f / ssum, B.talker_seed, idx, red);
     if (threadIdx.x == 0) {
         B.codes[0] = chosen;
         if (chosen != B.eos_id) B.seen[chosen] = 1u;
@@ -455,12 +478,26 @@ __device__ void tl_sample(const TlParams & P, const Work & B, float * xs, float 
 
 // --- code-predictor phases ---------------------------------------------------
 
-__device__ void cp_embed(const CpParams & P, const CpWeights & W, const Work & B, int pos) {
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x, nth = gridDim.x * blockDim.x;
+// The predictor's input at step `pos`: the talker's hidden at pos 0, the talker's
+// codebook-0 embedding at pos 1, then the fed-back code of step pos-1 through that
+// step's own table - all at the talker's width - projected to the predictor's width
+// when the two differ (HF small_to_mtp_projection; the identity when they match).
+//
+// Every block can name the source row on its own: codes[] and hidden_out were
+// written before the barrier that precedes this phase. So the projecting path
+// stages the row into LDS per block and needs no extra buffer and no extra barrier.
+__device__ void cp_embed(const CpParams & P, const CpWeights & W, const Work & B, int pos, float * xs) {
     const uint16_t * row = nullptr;
-    if (pos == 1) row = W.talker_codec_embd + static_cast<size_t>(B.codes[0]) * P.hidden;
-    else if (pos >= 2) row = W.codec_embd[pos - 2] + static_cast<size_t>(B.codes[pos - 1]) * P.hidden;
-    for (int i = tid; i < P.hidden; i += nth) B.cx[i] = (pos == 0) ? B.hidden_out[i] : h2f(row, i);
+    if (pos == 1) row = W.talker_codec_embd + static_cast<size_t>(B.codes[0]) * P.in_dim;
+    else if (pos >= 2) row = W.codec_embd[pos - 2] + static_cast<size_t>(B.codes[pos - 1]) * P.in_dim;
+    if (!W.proj_w) {
+        const int tid = blockIdx.x * blockDim.x + threadIdx.x, nth = gridDim.x * blockDim.x;
+        for (int i = tid; i < P.hidden; i += nth) B.cx[i] = (pos == 0) ? B.hidden_out[i] : h2f(row, i);
+        return;
+    }
+    for (int i = threadIdx.x; i < P.in_dim; i += blockDim.x) xs[i] = (pos == 0) ? B.hidden_out[i] : h2f(row, i);
+    __syncthreads();
+    grid_matvec<false, true>(W.proj_w, P.hidden, P.in_dim, xs, B.cx, W.proj_b);
 }
 
 __device__ void cp_head(const CpParams & P, const CpWeights & W, const Work & B, int pos, float * xs, float * red) {
@@ -470,7 +507,7 @@ __device__ void cp_head(const CpParams & P, const CpWeights & W, const Work & B,
 }
 
 // Block 0 samples codebook `pos` from head pos-1 into codes[pos].
-__device__ void cp_sample(const CpParams & P, const Work & B, int pos, float * xs, float * red, SampleScratch & S) {
+__device__ void cp_sample(const CpParams & P, const Work & B, int pos, float * xs, float * red, unsigned * hist, int * idx) {
     if (pos < 1 || blockIdx.x != 0) return;
     const int V = P.vocab;
     const float * lg = B.clogits + static_cast<size_t>(pos - 1) * V;
@@ -483,7 +520,7 @@ __device__ void cp_sample(const CpParams & P, const Work & B, int pos, float * x
     for (int i = threadIdx.x; i < V; i += blockDim.x) { xs[i] = lg[i] / B.cp_temperature; m = fmaxf(m, xs[i]); }
     const float mx = dev::block_max(m, red);
     __syncthreads();
-    const float threshold = (B.cp_top_k > 0 && B.cp_top_k < V) ? block_kth_largest(xs, V, B.cp_top_k, S.hist, red) : -INFINITY;
+    const float threshold = (B.cp_top_k > 0 && B.cp_top_k < V) ? block_kth_largest(xs, V, B.cp_top_k, hist, red) : -INFINITY;
     __syncthreads();
     float ssum = 0.f;
     for (int i = threadIdx.x; i < V; i += blockDim.x) {
@@ -494,15 +531,17 @@ __device__ void cp_sample(const CpParams & P, const Work & B, int pos, float * x
     }
     ssum = dev::block_sum(ssum, red);
     __syncthreads();
-    const int chosen = block_draw(xs, V, 1.f / ssum, B.cp_seed + static_cast<uint64_t>(pos) * 0xD1B54A32D192ED03ull, S.idx, red);
+    const int chosen = block_draw(xs, V, 1.f / ssum, B.cp_seed + static_cast<uint64_t>(pos) * 0xD1B54A32D192ED03ull, idx, red);
     if (threadIdx.x == 0) B.codes[pos] = chosen;
     __syncthreads();
 }
 
 
-// next frame's step embedding: codec_embd[cb0] + sum_cb cp_embd[cb][code] + trailing
+// next frame's step embedding: codec_embd[cb0] + sum_cb cp_embd[cb][code] + trailing.
+// This is the talker's input, so it is assembled at the talker's width (in_dim) -
+// the width the embedding tables are stored at - not the predictor's.
 __device__ void assemble_step(const CpParams & P, const CpWeights & W, const Work & B) {
-    const int hidden = P.hidden;
+    const int hidden = P.in_dim;
     for (int h = blockIdx.x * blockDim.x + threadIdx.x; h < hidden; h += gridDim.x * blockDim.x) {
         float v = h2f(W.talker_codec_embd + static_cast<size_t>(B.codes[0]) * hidden, h);
 #pragma unroll
@@ -514,10 +553,22 @@ __device__ void assemble_step(const CpParams & P, const CpWeights & W, const Wor
 
 // --- the frame ----------------------------------------------------------------
 
-__global__ void __launch_bounds__(BLOCK) k_frame(TlParams TP, TlWeights TW, CpParams CP, CpWeights CW, Work B) {
-    __shared__ float xs[VEC_MAX];
-    __shared__ float red[32];
-    __shared__ SampleScratch samp;
+// FLOOR_LDS: the vector fits VEC_FLOOR, so the block is a compile-time __shared__
+// array and the carve is a compile-time offset - which is how this kernel was
+// written before the 1.7B needed a bigger vector. Measured on gfx1151, going to a
+// runtime LDS base costs the 0.6B about 1.5% of its frame time (LDS addressing
+// loses its immediate offsets), so the model that fits keeps the static form and
+// only the model that does not pays for the flexibility.
+template <bool FLOOR_LDS>
+__global__ void __launch_bounds__(BLOCK) k_frame_t(TlParams TP, TlWeights TW, CpParams CP, CpWeights CW, Work B) {
+    __shared__ float floor_lds[FLOOR_LDS ? lds_floats(VEC_FLOOR) : 1];
+    extern __shared__ float dyn_lds[];
+    float * const base = FLOOR_LDS ? floor_lds : dyn_lds;
+    const int vec = FLOOR_LDS ? VEC_FLOOR : B.vec_max;
+    float * xs = base;
+    float * red = xs + vec;
+    unsigned * hist = reinterpret_cast<unsigned *>(red + 32);
+    int * idx = reinterpret_cast<int *>(hist + 256);
     const unsigned nb = gridDim.x;
 #ifdef NAVI_FRAME_PROFILE
     int prof_i = 0;
@@ -549,11 +600,19 @@ __global__ void __launch_bounds__(BLOCK) k_frame(TlParams TP, TlWeights TW, CpPa
         }
         tl_head(TP, TW, B, xs, red);                                                                          GBSYNC();
     }
-    tl_sample(TP, B, xs, red, samp);                                                                          GBSYNC();
+    tl_sample(TP, B, xs, red, hist, idx);                                                                          GBSYNC();
 
     const int ckv = CP.n_kv_head * CP.head_dim;
     for (int pos = 0; pos < CP_POS; ++pos) {
-        cp_embed(CP, CW, B, pos);                                                                             GBSYNC();
+        cp_embed(CP, CW, B, pos, xs);                                                                         GBSYNC();
+        // Parity capture (null in production), after the barrier: cp_embed's projection
+        // writes B.cx partitioned across the grid, so reading it grid-strided is only
+        // safe once every block has arrived. The next phase only reads B.cx too, so
+        // this needs no barrier of its own.
+        if (B.cp_input_log) {
+            for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < CP.hidden; i += gridDim.x * blockDim.x)
+                B.cp_input_log[static_cast<size_t>(pos) * CP.hidden + i] = B.cx[i];
+        }
         for (int il = 0; il < CP.n_layer; ++il) {
             uint16_t * kc = B.ckcache + static_cast<size_t>(il) * CP_POS * ckv;
             uint16_t * vc = B.cvcache + static_cast<size_t>(il) * CP_POS * ckv;
@@ -571,7 +630,7 @@ __global__ void __launch_bounds__(BLOCK) k_frame(TlParams TP, TlWeights TW, CpPa
             grid_matvec<true>(CW.w_down[il], CP.hidden, CP.ff, xs, B.cx);                                     GBSYNC();
         }
         cp_head(CP, CW, B, pos, xs, red);                                                                     GBSYNC();
-        cp_sample(CP, B, pos, xs, red, samp);                                                                 GBSYNC();
+        cp_sample(CP, B, pos, xs, red, hist, idx);                                                                 GBSYNC();
     }
     assemble_step(CP, CW, B);
     GBSYNC();
@@ -597,6 +656,8 @@ struct Frame::Impl {
     Work B{};
     FrameOptions opt;
     int grid = 0, occ = 0;
+    std::size_t lds_bytes = 0;    // dynamic LDS for the launch; 0 when the static form is used
+    bool floor_lds = false;
     std::vector<void *> owned;
     hipEvent_t ev0 = nullptr, ev1 = nullptr;
     int32_t h_codes[CP_POS] = {};
@@ -660,7 +721,8 @@ struct Frame::Impl {
         NAVI_HIP(hipMemsetAsync((void *) B.bar, 0, 3 * sizeof(unsigned), stream));
         NAVI_HIP(hipEventRecord(ev0, stream));
         void * args[] = {&TP, &TW, &CP, &CW, &B};
-        const hipError_t e = hipLaunchCooperativeKernel((const void *) k_frame, dim3(grid), dim3(BLOCK), args, 0, stream);
+        const void * k = floor_lds ? (const void *) k_frame_t<true> : (const void *) k_frame_t<false>;
+        const hipError_t e = hipLaunchCooperativeKernel(k, dim3(grid), dim3(BLOCK), args, lds_bytes, stream);
         if (e != hipSuccess) { r.error = std::string("cooperative launch failed: ") + hipGetErrorString(e); return r; }
         NAVI_HIP(hipEventRecord(ev1, stream));
         NAVI_HIP(hipMemcpyAsync(h_codes, B.codes, sizeof(h_codes), hipMemcpyDeviceToHost, stream));
@@ -691,15 +753,24 @@ std::unique_ptr<Frame> Frame::create(const Device & dev, const DeviceWeights & w
     const auto & tp = p.talker;
     const auto & cp = p.cp;
     if (tp.n_layer > MAX_LAYERS || cp.n_layer > CP_MAX_LAYERS) fail("frame: too many layers for the kernel");
-    if (tp.ff > VEC_MAX || tp.vocab > VEC_MAX || cp.ff > VEC_MAX || cp.vocab > VEC_MAX || tp.head_dim > 128 || cp.head_dim > 128) {
-        fail("frame: model shape exceeds the kernel's LDS vector");
-    }
+    if (tp.head_dim > 128 || cp.head_dim > 128) fail("frame: head_dim exceeds the kernel's block layout");
     if (p.n_code_groups != CP_POS) fail("frame: kernel is built for 16 codebooks");
     if ((cp.vocab & (cp.vocab - 1)) != 0) fail("frame: cp vocab must be a power of two for the top-k sort");
-    if (tp.hidden != cp.hidden) fail("frame: talker/cp hidden sizes differ (small_to_mtp_projection not supported)");
+
+    // Every vector the kernel stages in LDS, plus the floor (see VEC_FLOOR).
+    const int vec_max = std::max({VEC_FLOOR, tp.hidden, tp.ff, tp.vocab, tp.n_head * tp.head_dim,
+                                  cp.hidden, cp.ff, cp.vocab, cp.n_head * cp.head_dim});
+    I.floor_lds = vec_max == VEC_FLOOR;
+    const std::size_t need = static_cast<std::size_t>(lds_floats(vec_max)) * sizeof(float);
+    if (need > dev.info().lds_per_block) {
+        fail("frame: the model needs " + std::to_string(need) + " B of LDS per block, the device has "
+             + std::to_string(dev.info().lds_per_block));
+    }
+    // The static form carries its own LDS; only the larger form asks the launch for it.
+    I.lds_bytes = I.floor_lds ? 0 : need;
 
     I.TP = {tp.hidden, tp.n_head, tp.n_kv_head, tp.head_dim, tp.ff, tp.vocab, tp.n_layer, tp.rms_eps, static_cast<float>(tp.rope_theta)};
-    I.CP = {cp.hidden, cp.n_head, cp.n_kv_head, cp.head_dim, cp.ff, cp.vocab, cp.n_layer, cp.rms_eps, static_cast<float>(cp.rope_theta)};
+    I.CP = {cp.hidden, tp.hidden, cp.n_head, cp.n_kv_head, cp.head_dim, cp.ff, cp.vocab, cp.n_layer, cp.rms_eps, static_cast<float>(cp.rope_theta)};
     auto f16p = [&](const std::string & n) { return w.get(n).as<uint16_t>(); };
     auto f32p = [&](const std::string & n) { return w.get(n).as<float>(); };
     for (int l = 0; l < tp.n_layer; ++l) {
@@ -738,6 +809,13 @@ std::unique_ptr<Frame> Frame::create(const Device & dev, const DeviceWeights & w
         I.CW.codec_embd[i] = f16p("talker.code_predictor.model.codec_embedding." + std::to_string(i) + ".weight");
         I.CW.lm_head[i] = f16p("talker.code_predictor.lm_head." + std::to_string(i) + ".weight");
     }
+    // The predictor's inputs arrive at the talker's width (docs/model.md). When the
+    // two widths differ they are projected down first; when they match, HF's stage is
+    // nn.Identity() and the tensors are absent, so the kernel takes the direct path.
+    if (cp.hidden != tp.hidden) {
+        I.CW.proj_w = f16p("talker.code_predictor.small_to_mtp_projection.weight");
+        I.CW.proj_b = f32p("talker.code_predictor.small_to_mtp_projection.bias");
+    }
 
     Work & B = I.B;
     const int Q = tp.n_head * tp.head_dim, KV = tp.n_kv_head * tp.head_dim;
@@ -752,6 +830,7 @@ std::unique_ptr<Frame> Frame::create(const Device & dev, const DeviceWeights & w
     B.cvcache = I.alloc<uint16_t>(static_cast<std::size_t>(cp.n_layer) * CP_POS * CKV);
     B.codes = I.alloc<int32_t>(CP_POS);
     B.step_out = I.alloc<float>(tp.hidden);
+    B.vec_max = vec_max;
     B.bar = I.alloc<unsigned>(3);
 #ifdef NAVI_FRAME_PROFILE
     B.prof = I.alloc<unsigned long long>(2 * 4096);
@@ -762,7 +841,8 @@ std::unique_ptr<Frame> Frame::create(const Device & dev, const DeviceWeights & w
 
     // Grid: blocks_per_mp co-resident blocks per multiprocessor (WGP), checked
     // against what the kernel's registers/LDS actually allow.
-    NAVI_HIP(hipOccupancyMaxActiveBlocksPerMultiprocessor(&I.occ, k_frame, BLOCK, 0));
+    NAVI_HIP(I.floor_lds ? hipOccupancyMaxActiveBlocksPerMultiprocessor(&I.occ, k_frame_t<true>, BLOCK, 0)
+                         : hipOccupancyMaxActiveBlocksPerMultiprocessor(&I.occ, k_frame_t<false>, BLOCK, I.lds_bytes));
     if (I.occ < 1) fail("frame: k_frame cannot be resident at all");
     if (opt.blocks_per_mp > I.occ) {
         fail("frame: blocks_per_mp " + std::to_string(opt.blocks_per_mp) + " exceeds the kernel's occupancy " + std::to_string(I.occ));
@@ -798,6 +878,15 @@ FrameResult Frame::run_first(const float * d_hidden, const float * d_logits, con
 FrameResult Frame::run(KvCache & kv, int n_past, const float * d_trailing, const Sampling & s, std::uint64_t seed, int frame_index) {
     Impl & I = *impl_;
     if (n_past >= kv.max_pos) { FrameResult r; r.error = "KV cache full"; return r; }
+    // attend() keeps one score per key position in the LDS vector, so a position
+    // past it would write off the end of xs. The KV cache's max_pos is the
+    // Talker's business and says nothing about the kernel's LDS, so check both.
+    if (n_past < 0 || n_past >= I.B.vec_max) {
+        FrameResult r;
+        r.error = "position " + std::to_string(n_past) + " is outside the frame kernel's score vector ("
+                  + std::to_string(I.B.vec_max) + ")";
+        return r;
+    }
     if (kv.n_layer != I.TP.n_layer) { FrameResult r; r.error = "KV cache layer count mismatch"; return r; }
     for (int l = 0; l < kv.n_layer; ++l) { I.B.kcache[l] = kv.k[static_cast<std::size_t>(l)]; I.B.vcache[l] = kv.v[static_cast<std::size_t>(l)]; }
     I.B.skip_talker = 0;
@@ -810,6 +899,16 @@ FrameResult Frame::run(KvCache & kv, int n_past, const float * d_trailing, const
 }
 
 const float * Frame::d_step_out() const { return impl_->B.step_out; }
+
+void Frame::enable_cp_input_capture() {
+    if (!impl_->B.cp_input_log) impl_->B.cp_input_log = impl_->alloc<float>(static_cast<std::size_t>(CP_POS) * impl_->CP.hidden);
+}
+const float * Frame::d_cp_inputs() const { return impl_->B.cp_input_log; }
+int Frame::cp_hidden() const { return impl_->CP.hidden; }
+int Frame::max_position() const { return impl_->B.vec_max; }
+std::size_t Frame::lds_bytes() const {
+    return impl_->floor_lds ? static_cast<std::size_t>(lds_floats(VEC_FLOOR)) * sizeof(float) : impl_->lds_bytes;
+}
 int Frame::grid_blocks() const { return impl_->grid; }
 int Frame::occupancy_per_mp() const { return impl_->occ; }
 

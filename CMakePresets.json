@@ -70,6 +70,13 @@
       "output": {
         "outputOnFailure": true
       }
+    },
+    {
+      "name": "strix",
+      "configurePreset": "strix",
+      "output": {
+        "outputOnFailure": true
+      }
     }
   ]
 }

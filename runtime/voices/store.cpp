@@ -21,6 +21,11 @@ namespace navi::voices {
 
 namespace {
 
+// Codebooks per frame in a reference-code file. The model's own count is
+// Params::n_code_groups; the store does not read the model, so this is the file
+// format's number and a mismatch is refused rather than reinterpreted.
+constexpr std::size_t CODE_GROUPS = 16;
+
 // SHA-256 (FIPS 180-4), enough to fingerprint a sample. No dependency.
 class Sha256 {
 public:
@@ -122,6 +127,19 @@ void write_atomic(const fs::path & p, const void * data, std::size_t n) {
     if (ec) fail("cannot rename " + tmp.string() + ": " + ec.message());
 }
 
+std::string sha256_of(const std::string & bytes) {
+    Sha256 s;
+    s.update(reinterpret_cast<const std::uint8_t *>(bytes.data()), bytes.size());
+    return s.hex();
+}
+
+template <class T>
+std::string sha256_of(const std::vector<T> & v) {
+    Sha256 s;
+    s.update(reinterpret_cast<const std::uint8_t *>(v.data()), v.size() * sizeof(T));
+    return s.hex();
+}
+
 } // namespace
 
 std::string Store::sha256_hex(std::span<const std::uint8_t> bytes) {
@@ -171,8 +189,34 @@ Store Store::open(const std::string & dir, int dim) {
                              emb.size() / sizeof(float), dim);
                 continue;
             }
+            const std::string emb_sha = j.str_or("embedding_sha256", "");
+            if (!emb_sha.empty() && emb_sha != sha256_of(emb)) {
+                std::fprintf(stderr, "voices: skipping %s: embedding.f32 does not match the hash in "
+                                     "voice.json (an interrupted replacement, or an edited file)\n", id.c_str());
+                continue;
+            }
             v->embedding.resize(static_cast<std::size_t>(vdim));
             std::memcpy(v->embedding.data(), emb.data(), emb.size());
+
+            // Reference codes for in-context cloning. Only usable when the manifest hashes
+            // them: an unhashed or mismatched code file cannot be trusted to belong to this
+            // sample, and dropping ICL is better than conditioning on the wrong audio.
+            const int frames = static_cast<int>(j.int_or("ref_frames", 0));
+            const std::string codes_sha = j.str_or("ref_codes_sha256", "");
+            const fs::path codes_path = entry.path() / "ref_codes.i32";
+            if (frames > 0 && fs::exists(codes_path)) {
+                const std::string raw = read_file(codes_path);
+                const std::size_t want = static_cast<std::size_t>(frames) * CODE_GROUPS * sizeof(std::int32_t);
+                if (codes_sha.empty() || raw.size() != want || codes_sha != sha256_of(raw)) {
+                    std::fprintf(stderr, "voices: %s loads embedding-only: ref_codes.i32 is %zu bytes and "
+                                         "%s\n", id.c_str(), raw.size(),
+                                 codes_sha.empty() ? "the manifest does not hash it" : "does not match its hash");
+                } else {
+                    v->ref_frames = frames;
+                    v->ref_codes.resize(want / sizeof(std::int32_t));
+                    std::memcpy(v->ref_codes.data(), raw.data(), raw.size());
+                }
+            }
             s.voices_[id] = std::move(v);
         } catch (const std::exception & e) {
             std::fprintf(stderr, "voices: skipping %s: %s\n", id.c_str(), e.what());
@@ -213,13 +257,47 @@ VoicePtr Store::put(Voice v, std::span<const std::uint8_t> sample_wav) {
     if (dim_ > 0 && static_cast<int>(v.embedding.size()) != dim_) fail("voices: embedding has the wrong size");
     if (v.created.empty()) v.created = now_utc();
     if (v.sample_sha256.empty()) v.sample_sha256 = sha256_hex(sample_wav);
+    if (v.ref_frames > 0 && v.ref_codes.size() != static_cast<std::size_t>(v.ref_frames) * CODE_GROUPS) {
+        fail("voices: " + v.id + " has " + std::to_string(v.ref_codes.size()) + " codes, not "
+             + std::to_string(v.ref_frames) + " x " + std::to_string(CODE_GROUPS));
+    }
     const fs::path vdir = fs::path(dir_) / v.id;
     std::error_code ec;
     fs::create_directories(vdir, ec);
     if (ec) fail("voices: cannot create " + vdir.string() + ": " + ec.message());
+
+    // A manifest from an older build has no payload hashes, so a crash during the
+    // replacement below would leave it describing the new payloads with nothing to check
+    // them against. Hash what is on disk NOW and write that manifest first; then any
+    // interrupted replacement is detectable (store.h).
+    const fs::path meta = vdir / "voice.json";
+    if (fs::exists(meta)) {
+        try {
+            Json old = Json::parse(read_file(meta));
+            if (old.str_or("embedding_sha256", "").empty()) {
+                const std::string emb = read_file(vdir / "embedding.f32");   // throws if unreadable
+                old.set("embedding_sha256", sha256_of(emb));
+                old.set("ref_codes_sha256", std::string());                  // explicitly: no verified codes
+                old.set("ref_frames", static_cast<std::int64_t>(0));
+                const std::string text = old.dump() + "\n";
+                write_atomic(meta, text.data(), text.size());
+            }
+        } catch (const std::exception & ex) {
+            fail("voices: " + v.id + " has a voice.json with no payload hashes and its embedding.f32 "
+                 "cannot be read (" + ex.what() + "), so replacing it could not be made detectable; "
+                 "move the directory aside and re-register");
+        }
+    }
+
     // Payloads first, the manifest last: a voice exists once voice.json does.
     write_atomic(vdir / "embedding.f32", v.embedding.data(), v.embedding.size() * sizeof(float));
     if (!sample_wav.empty()) write_atomic(vdir / "sample.wav", sample_wav.data(), sample_wav.size());
+    if (!v.ref_codes.empty()) {
+        write_atomic(vdir / "ref_codes.i32", v.ref_codes.data(), v.ref_codes.size() * sizeof(std::int32_t));
+    } else {
+        std::error_code rm;
+        fs::remove(vdir / "ref_codes.i32", rm);   // no stale codes beside a new sample
+    }
     Json j;
     j.set("name", v.name);
     j.set("ref_text", v.ref_text);
@@ -228,12 +306,33 @@ VoicePtr Store::put(Voice v, std::span<const std::uint8_t> sample_wav) {
     j.set("sample_seconds", v.sample_seconds);
     j.set("dim", static_cast<std::int64_t>(v.embedding.size()));
     j.set("created", v.created);
+    j.set("embedding_sha256", sha256_of(v.embedding));
+    j.set("ref_frames", static_cast<std::int64_t>(v.ref_frames));
+    j.set("ref_codes_sha256", v.ref_codes.empty() ? std::string() : sha256_of(v.ref_codes));
     const std::string text = j.dump() + "\n";
     write_atomic(vdir / "voice.json", text.data(), text.size());
     auto ptr = std::make_shared<const Voice>(std::move(v));
     std::lock_guard<std::mutex> l(*m_);
     voices_[ptr->id] = ptr;
     return ptr;
+}
+
+bool Store::current(const std::string & id, const std::string & sample_sha256, const std::string & ref_text,
+                    bool can_make_codes) const {
+    const VoicePtr v = find(id);
+    if (!v || v->sample_sha256 != sample_sha256 || v->ref_text != ref_text) return false;
+    if (v->icl()) return true;   // already has codes; this model's encoder is irrelevant
+    // No codes yet: re-cloning gains them only if there is a transcript to use and a model
+    // that can make them. Otherwise there is nothing to gain and this is a no-op.
+    return !(!ref_text.empty() && can_make_codes);
+}
+
+std::vector<std::int32_t> Store::codes_for_sample(const std::string & id, const std::string & sample_sha256,
+                                                  int * ref_frames) const {
+    const VoicePtr v = find(id);
+    if (!v || v->sample_sha256 != sample_sha256 || !v->icl()) return {};
+    if (ref_frames) *ref_frames = v->ref_frames;
+    return v->ref_codes;
 }
 
 bool Store::remove(const std::string & id) {

@@ -163,7 +163,8 @@ TRANSFORMER_KEYS = [
 ]
 
 
-def write_metadata(w: NaviWriter, root: Path, with_encoder: bool, target: str, codec_target: str | None = None):
+def write_metadata(w: NaviWriter, root: Path, with_encoder: bool, target: str, codec_target: str | None = None,
+                   encoder_target: str | None = None):
     cfg = json.loads((root / "config.json").read_text())
     tk = cfg["talker_config"]
     cp = tk["code_predictor_config"]
@@ -181,6 +182,8 @@ def write_metadata(w: NaviWriter, root: Path, with_encoder: bool, target: str, c
     w.add_kv("general.codec_dtype", codec_target or target)
     w.add_kv("general.converter", "navi-tts tools/convert.py format-v1")
     w.add_kv("general.has_codec_encoder", with_encoder)
+    if with_encoder:
+        w.add_kv("general.codec_encoder_dtype", encoder_target or "f32")
 
     for k in ("im_start_token_id", "im_end_token_id", "assistant_token_id",
               "tts_bos_token_id", "tts_eos_token_id", "tts_pad_token_id"):
@@ -242,6 +245,24 @@ def write_metadata(w: NaviWriter, root: Path, with_encoder: bool, target: str, c
             w.add_kv(f"gen.{k}", gen[k])
 
 
+def encoder_keep(name: str, n_valid: int) -> bool:
+    """Which codec-encoder tensors the engine loads.
+
+    Encoding needs each quantizer group's `input_proj` and the first `n_valid` codebooks
+    (1 semantic + n_valid - 1 acoustic of the 31 the checkpoint carries). It never needs
+    `output_proj` - that is the decode direction, and the decoder has its own copy - nor the
+    acoustic codebooks past the ones the talker has embeddings for. Dropping them saves
+    34.7 MB and keeps `info --model` free of "unused" noise.
+    """
+    if "quantizer" not in name:
+        return True
+    if "output_proj" in name:
+        return False
+    if "acoustic" in name and ".layers." in name:
+        return int(name.split(".layers.")[1].split(".")[0]) < n_valid - 1
+    return True
+
+
 def add_file_bytes(w: NaviWriter, name: str, path: Path):
     w.add_tensor(name, DTYPE_U8, np.frombuffer(path.read_bytes(), dtype=np.uint8))
 
@@ -268,11 +289,21 @@ def store(w: NaviWriter, st: Stats, name: str, arr: np.ndarray, target_dtype: in
     st.bytes += arr.size * np.dtype(NP_DTYPE[dtype]).itemsize
 
 
-def convert(root: Path, out: Path, target: str, with_encoder: bool, verbose: bool, codec_target: str | None = None) -> None:
+def convert(root: Path, out: Path, target: str, with_encoder: bool, verbose: bool, codec_target: str | None = None,
+            encoder_target: str | None = None) -> None:
     target_dtype = TARGET_DTYPES[target]
     codec_dtype = TARGET_DTYPES[codec_target or target]
+    # The codec ENCODER is f32 whatever the rest is, and this is not a style choice: its
+    # output is 16 nearest-centroid searches per frame, a cascade with no error averaging,
+    # so f16 weights flip 1.3% of the codes (a 1e-5 tie in one codebook changes every later
+    # codebook of that frame) and move the ICL prefill hidden by 1.3e-2 rel-rms - 36x the
+    # talker prefill gate. It costs 190 MB and runs once per clone, never per frame.
+    # tests/reference/ref_codes_f16w.npy is the measurement. The engine's encoder kernels
+    # read f32 only and refuse a blob whose encoder is anything else by name - supporting
+    # f16 there would mean shipping the precision the measurement rules out.
+    encoder_dtype = TARGET_DTYPES[encoder_target] if encoder_target else DTYPE_F32
     w = NaviWriter()
-    write_metadata(w, root, with_encoder, target, codec_target)
+    write_metadata(w, root, with_encoder, target, codec_target, encoder_target)
     for fname, tname in (("vocab.json", "tokenizer.vocab.json"), ("merges.txt", "tokenizer.merges.txt"),
                          ("tokenizer_config.json", "tokenizer.config.json")):
         add_file_bytes(w, tname, root / fname)
@@ -287,10 +318,13 @@ def convert(root: Path, out: Path, target: str, with_encoder: bool, verbose: boo
 
     codec = SafeTensors(root / "speech_tokenizer" / "model.safetensors")
     w.add_kv("general.source.codec", "speech_tokenizer/model.safetensors")
+    n_valid = int(json.loads((root / "speech_tokenizer" / "config.json").read_text())
+                  ["encoder_valid_num_quantizers"])
     names = codec.names()
     pending_codebooks: dict[str, dict[str, np.ndarray]] = {}
     for name in names:
-        if name.startswith("encoder.") and not with_encoder:
+        enc = name.startswith("encoder.")
+        if enc and (not with_encoder or not encoder_keep(name, n_valid)):
             continue
         leaf = name.rsplit(".", 1)[-1]
         if leaf == "initialized":
@@ -299,13 +333,15 @@ def convert(root: Path, out: Path, target: str, with_encoder: bool, verbose: boo
             base = name.rsplit(".", 1)[0]
             pending_codebooks.setdefault(base, {})[leaf] = codec.get(name)
             continue
-        store(w, st, "codec." + name, codec.get(name), codec_dtype)
+        store(w, st, "codec." + name, codec.get(name), encoder_dtype if enc else codec_dtype)
     for base, parts in pending_codebooks.items():
         emb = parts.get("embedding_sum", parts.get("embed_sum"))
         usage = parts["cluster_usage"]
         # EuclideanCodebook.decode: embedding_sum / cluster_usage.clamp(min=1e-5)
         book = emb / np.maximum(usage, 1e-5)[:, None]
-        store(w, st, "codec." + base + ".codebook", book.astype(np.float32), codec_dtype)
+        enc = base.startswith("encoder.")
+        store(w, st, "codec." + base + ".codebook", book.astype(np.float32),
+              encoder_dtype if enc else codec_dtype)
 
     size = w.write(out)
     print(f"wrote {out} ({size / 1e9:.3f} GB): {len(w.kv)} kv, {len(w.tensors)} tensors, "
@@ -322,10 +358,17 @@ def main():
     ap.add_argument("--dtype", choices=sorted(TARGET_DTYPES), default="f16", help="dtype for >=2-D tensors (default f16)")
     ap.add_argument("--codec-dtype", choices=sorted(TARGET_DTYPES), default=None,
                     help="dtype for the codec's >=2-D tensors (default: same as --dtype)")
-    ap.add_argument("--with-encoder", action="store_true", help="include the codec encoder (ICL cloning)")
+    ap.add_argument("--encoder-dtype", choices=sorted(TARGET_DTYPES), default=None,
+                    help="dtype for the codec encoder's >=2-D tensors (default: f32, and the engine's "
+                         "encoder kernels refuse anything else by tensor name - see convert() for why "
+                         "f16 is not an option there, and use this only to test that refusal)")
+    ap.add_argument("--with-encoder", action="store_true",
+                    help="include the codec encoder, which is what makes reference codes for ICL "
+                         "cloning (+190 MB: its weights are f32, see convert()). A blob without it "
+                         "still serves voices whose codes were made elsewhere.")
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args()
-    convert(a.model_dir, a.out, a.dtype, a.with_encoder, a.verbose, a.codec_dtype)
+    convert(a.model_dir, a.out, a.dtype, a.with_encoder, a.verbose, a.codec_dtype, a.encoder_dtype)
 
 
 if __name__ == "__main__":

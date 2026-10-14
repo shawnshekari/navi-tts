@@ -41,5 +41,32 @@
  "transformers": "4.57.3",
  "qwen_tts": "0.1.1",
  "python": "3.13.7",
- "numpy": "2.5.3"
+ "numpy": "2.5.3",
+ "ref_frames": 188,
+ "ref_conv_rows": 375,
+ "ref_codes_f16w_diff": 38,
+ "ref_codes_f16w_note": "documentation, not a gate: f16 encoder weights move the ICL prefill hidden by 1.3e-2 rel-rms, so the engine stores the encoder f32 while the decoder stays f16 (DESIGN 6)",
+ "icl_ref_text": "This is the reference recording used by the parity dumps.",
+ "icl_ref_text_note": "a FIXED STRING, not a transcription of the reference audio: no transcript exists for it. Parity does not depend on it being true. Nothing in the icl_* set is a listen reference.",
+ "icl_n_ref_text_ids": 16,
+ "icl": {
+  "ref_frames": 188,
+  "prefill_len": 198,
+  "trailing_len": 1,
+  "greedy_frames": 31,
+  "sampled_frames": 63
+ },
+ "icl_short": {
+  "ref_frames": 8,
+  "prefill_len": 18,
+  "trailing_len": 20
+ },
+ "icl_tooling": {
+  "note": "the icl_* and ref_{conv,xf,latents,codes_f16w} files were produced later than the rest of this directory, with the versions below. The discrete outputs (ref_codes, greedy_codes, sampled_codes, text_ids, speaker_mels) came out byte-identical to the shipped ones; the float stages moved by ~1e-6 rel-rms, and the 9 prefix rows that icl_prefill_embeds shares with prefill_embeds differ by 2.0e-07 rel-rms (9.5e-07 max), which is why the shipped files were not regenerated: the vocoder's kernel-exactness gate is 2e-5 and would have lost 6e-6 of its margin for nothing.",
+  "torch": "2.14.1+cpu",
+  "transformers": "4.57.3",
+  "qwen_tts": "0.1.1",
+  "python": "3.13.9",
+  "numpy": "2.5.3"
+ }
 }
