@@ -23,7 +23,8 @@ constexpr int MAX_LAYERS = 32;
 constexpr int CP_MAX_LAYERS = 8;
 constexpr int CP_POS = 16;          // hidden, cb0, then 14 fed-back codes
 constexpr int CP_HEADS = 15;        // codebooks 1..15
-constexpr int VEC_MAX = 4096;       // largest LDS vector: ff 3072, vocab 3072
+constexpr int VEC_MAX = 4096;       // largest LDS vector: ff 3072, vocab 3072, and attend()'s one score
+                                    // per key position (Frame::run bounds the position by it)
 constexpr int MV_ROWS = 2;         // rows per wave in a matvec: 2 rows x 4 loads in flight streams ~20% faster than 4 x 2 (bench/README)
 
 struct TlParams { int hidden, n_head, n_kv_head, head_dim, ff, vocab, n_layer; float eps, rope_theta; };
@@ -798,6 +799,15 @@ FrameResult Frame::run_first(const float * d_hidden, const float * d_logits, con
 FrameResult Frame::run(KvCache & kv, int n_past, const float * d_trailing, const Sampling & s, std::uint64_t seed, int frame_index) {
     Impl & I = *impl_;
     if (n_past >= kv.max_pos) { FrameResult r; r.error = "KV cache full"; return r; }
+    // attend() keeps one score per key position in the LDS vector, so a position
+    // past it would write off the end of xs. The KV cache's max_pos is the
+    // Talker's business and says nothing about the kernel's LDS, so check both.
+    if (n_past < 0 || n_past >= VEC_MAX) {
+        FrameResult r;
+        r.error = "position " + std::to_string(n_past) + " is outside the frame kernel's score vector ("
+                  + std::to_string(VEC_MAX) + ")";
+        return r;
+    }
     if (kv.n_layer != I.TP.n_layer) { FrameResult r; r.error = "KV cache layer count mismatch"; return r; }
     for (int l = 0; l < kv.n_layer; ++l) { I.B.kcache[l] = kv.k[static_cast<std::size_t>(l)]; I.B.vcache[l] = kv.v[static_cast<std::size_t>(l)]; }
     I.B.skip_talker = 0;
